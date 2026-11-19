@@ -7,14 +7,15 @@ Authors:
 - Mateusz Pstrągowski
 
 TODO:
-Igor
-- Improve time setting.
-- Disable inclusion of usage time of app on the block screen.
+
+BUGS:
+- When coming back to the application from running app catalogue, the block fails.
 
 Future:
+- Disable inclusion of usage time of app on the block screen (Not so simple).
 - Informational pamphlets/alternatives for "brain eaters".
 - UI simplification.
 - Weekday blocking.
-- UI for permmissions.
+- Advancing UI for permmissions.
 - Notification in case of disabled permissions on app enter.
-- Website blocking(optional).
+- Website blocking.
