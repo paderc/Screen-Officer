@@ -31,6 +31,9 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import com.anhaki.picktime.PickHourMinute
+import com.anhaki.picktime.utils.PickTimeFocusIndicator
+import com.anhaki.picktime.utils.PickTimeTextStyle
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -38,6 +41,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.text.DateFormat
 import java.util.Date
+import kotlin.times
 
 private data class SavedRules(val apps: List<AppRule>, val categories: List<CategoryRule>)
 
@@ -93,7 +97,8 @@ private fun ScreenOfficerApp(lifecycle: Lifecycle) {
     var selectedPackage by rememberSaveable { mutableStateOf("") }
     var selectedLabel by rememberSaveable { mutableStateOf("") }
     var selectedCategoryRule by rememberSaveable { mutableStateOf<String?>(null) }
-    var draftMinutes by rememberSaveable { mutableStateOf("30") }
+    var draftHours by rememberSaveable {mutableStateOf(0)}
+    var draftMinutes by rememberSaveable { mutableStateOf(30) }
     var draftMessage by rememberSaveable { mutableStateOf(DEFAULT_MESSAGE) }
     var draftMode by rememberSaveable { mutableStateOf(BlockMode.SOFT.name) }
     var draftEnabled by rememberSaveable { mutableStateOf(true) }
@@ -169,7 +174,7 @@ private fun ScreenOfficerApp(lifecycle: Lifecycle) {
         selectedPackage = packageName
         selectedCategoryRule = null
         selectedLabel = label
-        draftMinutes = (rule?.limitMinutes ?: 30).toString()
+        draftMinutes = (rule?.limitMinutes ?: 30)
         draftMessage = rule?.message ?: DEFAULT_MESSAGE
         draftMode = (rule?.mode ?: BlockMode.SOFT).name
         draftEnabled = rule?.enabled ?: true
@@ -182,7 +187,7 @@ private fun ScreenOfficerApp(lifecycle: Lifecycle) {
         selectedPackage = ""
         selectedCategoryRule = category.name
         selectedLabel = category.title
-        draftMinutes = (rule?.limitMinutes ?: 30).toString()
+        draftMinutes = (rule?.limitMinutes ?: 30)
         draftMessage = rule?.message ?: DEFAULT_MESSAGE
         draftMode = (rule?.mode ?: BlockMode.SOFT).name
         draftEnabled = rule?.enabled ?: true
@@ -205,6 +210,9 @@ private fun ScreenOfficerApp(lifecycle: Lifecycle) {
                 notice = "Your change could not be saved. Please try again."
             } finally { saving = false }
         }
+    }
+    fun selectedMinutes() : Int{
+        return draftMinutes + draftHours * 60
     }
     BackHandler(screen != "home" && !saving) {
         keyboard?.hide()
@@ -299,19 +307,24 @@ private fun ScreenOfficerApp(lifecycle: Lifecycle) {
                             if (category == null) "Set a daily limit for $selectedLabel. Usage resets at midnight in your phone's local time."
                             else "Set one shared daily limit for every ${category.title.lowercase()} app. Usage resets at midnight in your phone's local time.",
                         )
-                        OutlinedTextField(
-                            value = draftMinutes,
-                            onValueChange = { draftMinutes = it.filter(Char::isDigit).take(4) },
-                            modifier = Modifier.fillMaxWidth(), label = { Text("Daily limit in minutes") },
-                            singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                            isError = validation && (draftMinutes.toIntOrNull()?.let { it in 1..1440 } != true),
-                            supportingText = { Text("Choose 1–1440 minutes. Today's measured use counts toward this limit.") },
+                        Text(
+                            text = "Daily limit",
+                            modifier = Modifier.fillMaxWidth(),
                         )
-                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                            listOf(15, 30, 60, 90).forEach { minutes ->
-                                FilterChip(selected = draftMinutes == minutes.toString(), onClick = { draftMinutes = minutes.toString() }, label = { Text("$minutes min") }, modifier = Modifier.heightIn(min = 48.dp))
-                            }
-                        }
+                        PickHourMinute(
+                            initialHour = draftHours,
+                            initialMinute = draftMinutes,
+                            onHourChange = {draftHours = it},
+                            onMinuteChange = {draftMinutes = it},
+                            containerColor = MaterialTheme.colorScheme.primaryContainer,
+                            selectedTextStyle = PickTimeTextStyle(
+                                color = MaterialTheme.colorScheme.onPrimaryContainer
+                            ),
+                            focusIndicator = PickTimeFocusIndicator(
+                                enabled = true,
+                                background = MaterialTheme.colorScheme.primaryContainer
+                            )
+                        )
                         Column(Modifier.selectableGroup(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                             Text("When the limit is reached", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                             ModeChoice("Soft block", "Pause with a reminder. You can choose five more minutes of app use.", draftMode == BlockMode.SOFT.name) { draftMode = BlockMode.SOFT.name }
@@ -328,8 +341,8 @@ private fun ScreenOfficerApp(lifecycle: Lifecycle) {
                         Button(
                             onClick = {
                                 validation = true
-                                val minutes = draftMinutes.toIntOrNull()
-                                if (minutes != null && minutes in 1..1440 && draftMessage.isNotBlank()) {
+                                val minutes = selectedMinutes()
+                                if (minutes in 1..1440 && draftMessage.isNotBlank()) {
                                     if (category == null) {
                                         val rule = AppRule(selectedPackage, selectedLabel, minutes, draftMessage.trim(), BlockMode.valueOf(draftMode), draftEnabled)
                                         changeRule({ store.save(rule) }, "Limit saved for $selectedLabel.")
@@ -489,7 +502,6 @@ private fun RuleCard(rule: AppRule, usedMs: Long?, onEdit: () -> Unit, onToggle:
         }
     }
 }
-
 private fun formatUsage(millis: Long): String {
     val seconds = millis.coerceAtLeast(0) / 1_000
     return if (seconds < 60) "$seconds sec" else "${seconds / 60} min ${seconds % 60} sec"

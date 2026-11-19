@@ -15,14 +15,14 @@ import java.util.Locale
 class AppCatalog(private val context: Context) {
     fun loadApps(): List<TrackedApp> {
         val protectedPackages = SafetyApps.protectedPackages(context)
-
+        val activeApps = ActiveApps.usedSinceLastMonth(context)
         return context.packageManager.queryIntentActivities(
             Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER),
             PackageManager.MATCH_ALL
         )
             .filter {
                 val packageName = it.activityInfo.packageName
-                (packageName !in protectedPackages) &&
+                (packageName !in protectedPackages && packageName in activeApps)&&
                         !packageName.contains("gov")
             }
             .map {
