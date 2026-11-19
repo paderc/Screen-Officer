@@ -21,7 +21,7 @@ class AppCatalog(private val context: Context) {
         ).asSequence()
             .filter {
                 val packageName = it.activityInfo.packageName
-                !(packageName in protectedPackages) &&
+                packageName !in protectedPackages &&
                 packageName in usedSinceLastMonth &&
                 !packageName.contains("gov")
             }
