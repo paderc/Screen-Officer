@@ -1,21 +1,26 @@
 package com.example.screenofficer
 
+import android.app.usage.UsageStatsManager
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.provider.Settings
+import java.util.Calendar
 import java.util.Locale
 
 /** Only launchable apps are offered; essential phone controls remain reachable. */
 class AppCatalog(private val context: Context) {
     fun loadApps(): List<TrackedApp> {
         val protectedPackages = SafetyApps.protectedPackages(context)
+        val usedSinceLastMonth = ActiveApps.usedSinceLastMonth(context)
+
         return context.packageManager.queryIntentActivities(
             Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0,
         ).asSequence()
             .filterNot { it.activityInfo.packageName in protectedPackages }
+            .filter { it.activityInfo.packageName in usedSinceLastMonth}
             .map { TrackedApp(it.activityInfo.packageName, it.loadLabel(context.packageManager).toString()) }
             .distinctBy { it.packageName }
             .sortedWith(compareBy({ it.label.lowercase(Locale.getDefault()) }, { it.packageName }))
@@ -47,6 +52,22 @@ object SafetyApps {
             context.packageManager.queryIntentActivities(intent, PackageManager.MATCH_ALL)
                 .forEach { add(it.activityInfo.packageName) }
         }
+    }
+}
+object ActiveApps{
+    internal fun usedSinceLastMonth(context : Context) : Set<String> = buildSet {
+        add(context.packageName)
+        val usageStatsManager =
+            context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+
+        val now = Calendar.getInstance()
+
+        val lastWeek = now.clone() as Calendar
+        lastWeek.add(Calendar.DAY_OF_YEAR, -30)
+
+        val stats = usageStatsManager.queryAndAggregateUsageStats(lastWeek.timeInMillis, now.timeInMillis)
+            .filter { it.value.totalTimeInForeground > 0 }
+        addAll(stats.keys.asSequence())
     }
 }
 
