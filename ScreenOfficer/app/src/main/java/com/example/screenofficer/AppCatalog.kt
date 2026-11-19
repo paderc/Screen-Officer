@@ -6,29 +6,61 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.provider.Settings
 import java.util.Calendar
 import java.util.Locale
 
-/** Only launchable apps are offered; essential phone controls remain reachable. */
+/* Only launchable apps are offered; essential phone controls remain hidden. */
 class AppCatalog(private val context: Context) {
     fun loadApps(): List<TrackedApp> {
         val protectedPackages = SafetyApps.protectedPackages(context)
-        val usedSinceLastMonth = ActiveApps.usedSinceLastMonth(context)
 
         return context.packageManager.queryIntentActivities(
-            Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0,
-        ).asSequence()
+            Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER),
+            PackageManager.MATCH_ALL
+        )
             .filter {
                 val packageName = it.activityInfo.packageName
-                packageName !in protectedPackages &&
-                packageName in usedSinceLastMonth &&
-                !packageName.contains("gov")
+                (packageName !in protectedPackages) &&
+                        !packageName.contains("gov")
             }
-            .map { TrackedApp(it.activityInfo.packageName, it.loadLabel(context.packageManager).toString()) }
+            .map {
+                val packageName = it.activityInfo.packageName
+                val appInfo = it.activityInfo.applicationInfo
+                TrackedApp(
+                    packageName = packageName,
+                    label = it.loadLabel(context.packageManager).toString(),
+                    categories = AppCategoryClassifier.categoriesFor(
+                        packageName,
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) appInfo.category else -1,
+                    ),
+                )
+            }
             .distinctBy { it.packageName }
-            .sortedWith(compareBy({ it.label.lowercase(Locale.getDefault()) }, { it.packageName }))
+            .sortedWith(compareBy { it.label.lowercase(Locale.getDefault()) })
             .toList()
+    }
+}
+
+object ActiveApps {
+    internal fun usedSinceLastMonth(context: Context): Set<String> {
+        val usageStatsManager =
+            context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+
+        val now = Calendar.getInstance()
+        val lastWeek = now.clone() as Calendar
+        lastWeek.add(Calendar.DAY_OF_YEAR, -30)
+
+        val stats = usageStatsManager.queryAndAggregateUsageStats(
+            lastWeek.timeInMillis,
+            now.timeInMillis
+        )
+
+        return stats.values
+            .filter { it.totalTimeInForeground > 0 }
+            .map { it.packageName }
+            .toSet()
     }
 }
 
@@ -58,41 +90,38 @@ object SafetyApps {
         }
     }
 }
-object ActiveApps{
-    internal fun usedSinceLastMonth(context : Context) : Set<String> = buildSet {
-        add(context.packageName)
-        val usageStatsManager =
-            context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
-
-        val now = Calendar.getInstance()
-
-        val lastWeek = now.clone() as Calendar
-        lastWeek.add(Calendar.DAY_OF_YEAR, -30)
-
-        val stats = usageStatsManager.queryAndAggregateUsageStats(lastWeek.timeInMillis, now.timeInMillis)
-            .filter { it.value.totalTimeInForeground > 0 }
-        addAll(stats.keys.asSequence())
-    }
-}
 
 object PermissionAccess {
-    fun openUsageSettings(context: Context) {
-        open(context, Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS).apply {
-            data = Uri.parse("package:${context.packageName}")
-        }, Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
-    }
-
     fun openAccessibilitySettings(context: Context) {
-        open(context, Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS), Intent(Settings.ACTION_SETTINGS))
-    }
-
-    private fun open(context: Context, intent: Intent, fallback: Intent) {
         try {
-            context.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            context.startActivity(
+                Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            )
         } catch (_: ActivityNotFoundException) {
-            context.startActivity(fallback.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            context.startActivity(
+                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                    data = Uri.parse("package:${context.packageName}")
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            )
+        }
+    }
+    fun openUsageSettings(context: Context) {
+        try {
+            context.startActivity(
+                Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            )
+        } catch (_: ActivityNotFoundException) {
+            context.startActivity(
+                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                    data = Uri.parse("package:${context.packageName}")
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            )
         }
     }
 }
-
-
