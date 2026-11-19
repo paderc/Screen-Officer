@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.provider.Settings
 import java.util.Locale
 
@@ -16,7 +17,18 @@ class AppCatalog(private val context: Context) {
             Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0,
         ).asSequence()
             .filterNot { it.activityInfo.packageName in protectedPackages }
-            .map { TrackedApp(it.activityInfo.packageName, it.loadLabel(context.packageManager).toString()) }
+            .map {
+                val packageName = it.activityInfo.packageName
+                val appInfo = it.activityInfo.applicationInfo
+                TrackedApp(
+                    packageName = packageName,
+                    label = it.loadLabel(context.packageManager).toString(),
+                    categories = AppCategoryClassifier.categoriesFor(
+                        packageName,
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) appInfo.category else -1,
+                    ),
+                )
+            }
             .distinctBy { it.packageName }
             .sortedWith(compareBy({ it.label.lowercase(Locale.getDefault()) }, { it.packageName }))
             .toList()

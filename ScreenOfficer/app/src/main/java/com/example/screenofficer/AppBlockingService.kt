@@ -35,6 +35,10 @@ import kotlinx.coroutines.withTimeoutOrNull
 
 /** Observes package changes only; it never reads app text, views, or screenshots. */
 class AppBlockingService : AccessibilityService() {
+    private data class BlockingRules(
+        val rules: List<AppRule>,
+        val members: Map<String, Set<String>>,
+    )
     private var scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val changes = Channel<Unit>(Channel.CONFLATED)
     private lateinit var store: RuleStore
@@ -112,9 +116,29 @@ class AppBlockingService : AccessibilityService() {
 
     private suspend fun monitor() {
         while (scope.isActive) {
-            val rules = withContext(Dispatchers.IO) {
-                store.allRules().filter { it.enabled && !SafetyApps.isProtected(this@AppBlockingService, it.packageName) }
+            val blockingRules = withContext(Dispatchers.IO) {
+                val apps = AppCatalog(this@AppBlockingService).loadApps()
+                val appRules = store.allRules()
+                    .filter { it.enabled && !SafetyApps.isProtected(this@AppBlockingService, it.packageName) }
+                val categoryRules = store.allCategoryRules().filter { it.enabled }.map { categoryRule ->
+                    AppRule(
+                        packageName = categoryRule.id,
+                        label = "${categoryRule.label} (shared)",
+                        limitMinutes = categoryRule.limitMinutes,
+                        message = categoryRule.message,
+                        mode = categoryRule.mode,
+                        enabled = categoryRule.enabled,
+                    ) to apps.filter { categoryRule.category in it.categories }.map { it.packageName }.toSet()
+                }
+                BlockingRules(
+                    rules = appRules + categoryRules.map { it.first },
+                    members = buildMap {
+                        appRules.forEach { put(it.packageName, setOf(it.packageName)) }
+                        categoryRules.forEach { (rule, packages) -> put(rule.packageName, packages) }
+                    },
+                )
             }
+            val rules = blockingRules.rules
             if (rules.isEmpty() || !canDisplay()) {
                 hideOverlay()
                 // Package events, rule edits and unlock broadcasts wake an idle service.
@@ -124,7 +148,7 @@ class AppBlockingService : AccessibilityService() {
             val hint = foregroundHint
             val version = foregroundVersion
             val snapshot = withContext(Dispatchers.IO) {
-                usage.snapshot(rules.map { it.packageName }.toSet())
+                usage.snapshot(blockingRules.members.values.flatten().toSet())
             }
             if (version != foregroundVersion) continue
             // Window events can be transient dialogs and may never be followed by another
@@ -136,14 +160,16 @@ class AppBlockingService : AccessibilityService() {
             val freshHint = hint != null && SystemClock.elapsedRealtime() - foregroundHintAt < graceMs
             val current = if (freshHint) hint else snapshot.foregroundPackage
             if (!freshHint && snapshot.available) foregroundHint = snapshot.foregroundPackage
-            val rule = rules.firstOrNull { it.packageName == current }
-            val measured = current?.let { snapshot.usageMs[it] } ?: 0L
+            val rule = rules.firstOrNull { current != null && current in (blockingRules.members[it.packageName] ?: emptySet()) }
+            val measured = rule?.let { candidate ->
+                blockingRules.members[candidate.packageName].orEmpty().sumOf { snapshot.usageMs[it] ?: 0L }
+            } ?: 0L
             if (snapshot.available && canDisplay() && rule != null &&
                 // A window event can precede the corresponding UsageEvents event slightly.
                 snapshot.foregroundPackage == current &&
                 BlockPolicy.shouldBlock(rule, measured, store.snoozeThreshold(rule.packageName))
             ) {
-                showOverlay(rule, measured, snapshot.dayStartMs)
+                showOverlay(rule, measured, snapshot.dayStartMs, blockingRules.members)
             } else {
                 hideOverlay()
             }
@@ -160,7 +186,7 @@ class AppBlockingService : AccessibilityService() {
         (getSystemService(POWER_SERVICE) as PowerManager).isInteractive &&
             !(getSystemService(KEYGUARD_SERVICE) as KeyguardManager).isKeyguardLocked
 
-    private fun showOverlay(rule: AppRule, measuredMs: Long, dayStart: Long) {
+    private fun showOverlay(rule: AppRule, measuredMs: Long, dayStart: Long, members: Map<String, Set<String>>) {
         val key = OverlayKey(rule, dayStart)
         if (overlayKey == key && overlay != null) return
         hideOverlay()
@@ -207,13 +233,15 @@ class AppBlockingService : AccessibilityService() {
                 scope.launch {
                     // Use current measured usage, rather than the number displayed when
                     // this overlay opened. The allowance survives a process restart.
-                    val fresh = withContext(Dispatchers.IO) { usage.snapshot(setOf(rule.packageName)) }
-                    val savedRule = withContext(Dispatchers.IO) {
-                        store.allRules().firstOrNull { it.packageName == rule.packageName }
+                    val fresh = withContext(Dispatchers.IO) {
+                        usage.snapshot(members[rule.packageName].orEmpty())
                     }
-                    if (fresh.available && savedRule?.mode == BlockMode.SOFT && savedRule.enabled) {
+                    if (fresh.available && rule.mode == BlockMode.SOFT && rule.enabled) {
                         withContext(Dispatchers.IO) {
-                            store.snooze(rule.packageName, fresh.usageMs[rule.packageName] ?: measuredMs)
+                            val latestUsed = if (rule.packageName.startsWith("category.")) {
+                                members[rule.packageName].orEmpty().sumOf { fresh.usageMs[it] ?: 0L }
+                            } else fresh.usageMs[rule.packageName] ?: measuredMs
+                            store.snooze(rule.packageName, latestUsed, rule.mode, rule.enabled)
                         }
                     }
                     hideOverlay()

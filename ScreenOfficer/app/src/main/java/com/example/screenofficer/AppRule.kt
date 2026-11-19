@@ -2,7 +2,11 @@ package com.example.screenofficer
 
 const val DEFAULT_MESSAGE = "Is this still how you want to spend your time?"
 
-data class TrackedApp(val packageName: String, val label: String)
+data class TrackedApp(
+    val packageName: String,
+    val label: String,
+    val categories: Set<AppCategoryPreset> = emptySet(),
+)
 
 enum class BlockMode { SOFT, HARD }
 
@@ -14,6 +18,18 @@ data class AppRule(
     val mode: BlockMode = BlockMode.SOFT,
     val enabled: Boolean = true,
 )
+
+/** A single allowance shared by every installed app recognised in this category. */
+data class CategoryRule(
+    val category: AppCategoryPreset,
+    val limitMinutes: Int = 30,
+    val message: String = DEFAULT_MESSAGE,
+    val mode: BlockMode = BlockMode.SOFT,
+    val enabled: Boolean = true,
+) {
+    val id: String get() = "category.${category.name}"
+    val label: String get() = category.title
+}
 
 object BlockPolicy {
     fun shouldBlock(rule: AppRule, usedMs: Long, snoozeThresholdMs: Long?): Boolean {

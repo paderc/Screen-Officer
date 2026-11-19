@@ -39,6 +39,8 @@ import kotlinx.coroutines.withContext
 import java.text.DateFormat
 import java.util.Date
 
+private data class SavedRules(val apps: List<AppRule>, val categories: List<CategoryRule>)
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -79,6 +81,7 @@ private fun ScreenOfficerApp(lifecycle: Lifecycle) {
     var resumed by remember { mutableStateOf(lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) }
     var refreshVersion by remember { mutableIntStateOf(0) }
     var rules by remember { mutableStateOf(emptyList<AppRule>()) }
+    var categoryRules by remember { mutableStateOf(emptyList<CategoryRule>()) }
     var apps by remember { mutableStateOf(emptyList<TrackedApp>()) }
     var appsLoading by remember { mutableStateOf(true) }
     var appsError by remember { mutableStateOf<String?>(null) }
@@ -89,12 +92,14 @@ private fun ScreenOfficerApp(lifecycle: Lifecycle) {
     var screen by rememberSaveable { mutableStateOf("home") }
     var selectedPackage by rememberSaveable { mutableStateOf("") }
     var selectedLabel by rememberSaveable { mutableStateOf("") }
+    var selectedCategoryRule by rememberSaveable { mutableStateOf<String?>(null) }
     var draftMinutes by rememberSaveable { mutableStateOf("30") }
     var draftMessage by rememberSaveable { mutableStateOf(DEFAULT_MESSAGE) }
     var draftMode by rememberSaveable { mutableStateOf(BlockMode.SOFT.name) }
     var draftEnabled by rememberSaveable { mutableStateOf(true) }
     var validation by rememberSaveable { mutableStateOf(false) }
     var search by rememberSaveable { mutableStateOf("") }
+    var categoryFilter by rememberSaveable { mutableStateOf<String?>(null) }
     var notice by rememberSaveable { mutableStateOf<String?>(null) }
     var saving by remember { mutableStateOf(false) }
     var permissionDialog by rememberSaveable { mutableStateOf<String?>(null) }
@@ -113,16 +118,21 @@ private fun ScreenOfficerApp(lifecycle: Lifecycle) {
         store.preferences.registerOnSharedPreferenceChangeListener(listener)
         onDispose { store.preferences.unregisterOnSharedPreferenceChangeListener(listener) }
     }
-    LaunchedEffect(resumed, refreshVersion) {
+    LaunchedEffect(resumed, refreshVersion, apps) {
         if (!resumed) return@LaunchedEffect
         do {
             refreshing = true
             try {
                 val result = withContext(Dispatchers.IO) {
                     val currentRules = store.allRules()
-                    Triple(currentRules, repository.hasAccess(), repository.snapshot(currentRules.map { it.packageName }.toSet()))
+                    val currentCategories = store.allCategoryRules()
+                    val trackedPackages = currentRules.map { it.packageName }.toSet() + apps
+                        .filter { app -> currentCategories.any { it.category in app.categories } }
+                        .map { it.packageName }
+                    Triple(SavedRules(currentRules, currentCategories), repository.hasAccess(), repository.snapshot(trackedPackages))
                 }
-                rules = result.first
+                rules = result.first.apps
+                categoryRules = result.first.categories
                 usageAllowed = result.second
                 snapshot = result.third
                 serviceConnected = AppBlockingService.connected
@@ -157,7 +167,21 @@ private fun ScreenOfficerApp(lifecycle: Lifecycle) {
     fun editRule(packageName: String, label: String) {
         val rule = rules.firstOrNull { it.packageName == packageName }
         selectedPackage = packageName
+        selectedCategoryRule = null
         selectedLabel = label
+        draftMinutes = (rule?.limitMinutes ?: 30).toString()
+        draftMessage = rule?.message ?: DEFAULT_MESSAGE
+        draftMode = (rule?.mode ?: BlockMode.SOFT).name
+        draftEnabled = rule?.enabled ?: true
+        validation = false
+        notice = null
+        screen = "edit"
+    }
+    fun editCategory(category: AppCategoryPreset) {
+        val rule = categoryRules.firstOrNull { it.category == category }
+        selectedPackage = ""
+        selectedCategoryRule = category.name
+        selectedLabel = category.title
         draftMinutes = (rule?.limitMinutes ?: 30).toString()
         draftMessage = rule?.message ?: DEFAULT_MESSAGE
         draftMode = (rule?.mode ?: BlockMode.SOFT).name
@@ -217,26 +241,64 @@ private fun ScreenOfficerApp(lifecycle: Lifecycle) {
                 }
                 when (screen) {
                     "picker" -> {
-                        Heading("Choose an app", "Select an installed app to track and limit its daily use.")
+                        Heading("Choose an app", "Pick a category to find apps faster, then select the ones you want to limit.")
+                        Text("Browse by category", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            FilterChip(
+                                selected = categoryFilter == null,
+                                onClick = { categoryFilter = null },
+                                label = { Text("All apps") },
+                                modifier = Modifier.heightIn(min = 48.dp),
+                            )
+                            AppCategoryPreset.entries.forEach { category ->
+                                FilterChip(
+                                    selected = categoryFilter == category.name,
+                                    onClick = { categoryFilter = category.name },
+                                    label = { Text(category.title) },
+                                    modifier = Modifier.heightIn(min = 48.dp),
+                                )
+                            }
+                        }
+                        val selectedCategory = categoryFilter?.let { AppCategoryPreset.valueOf(it) }
+                        selectedCategory?.let { category ->
+                            Button(
+                                onClick = { editCategory(category) },
+                                modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp),
+                            ) { Text("Limit all ${category.title.lowercase()} apps together") }
+                        }
                         OutlinedTextField(
                             value = search, onValueChange = { search = it }, label = { Text("Search apps") },
                             singleLine = true, modifier = Modifier.fillMaxWidth(),
                         )
                         if (appsLoading) Text("Loading installed apps…")
                         appsError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-                        val matching = apps.filter { it.label.contains(search, true) || it.packageName.contains(search, true) }
-                        if (!appsLoading && matching.isEmpty()) Text("No matching apps. Phone, Settings and the home screen are always available.")
+                        val matching = apps.filter {
+                            (selectedCategory == null || selectedCategory in it.categories) &&
+                                (it.label.contains(search, true) || it.packageName.contains(search, true))
+                        }
+                        if (!appsLoading && matching.isEmpty()) Text(
+                            if (selectedCategory == null) "No matching apps. Phone, Settings and the home screen are always available."
+                            else "No installed ${selectedCategory.title.lowercase()} apps found. Try All apps or search by name.",
+                        )
                         matching.forEach { app ->
                             OutlinedButton(onClick = { editRule(app.packageName, app.label) }, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp), shape = RoundedCornerShape(16.dp)) {
                                 Column(Modifier.fillMaxWidth()) {
                                     Text(app.label, style = MaterialTheme.typography.titleMedium)
-                                    Text(app.packageName, style = MaterialTheme.typography.bodySmall)
+                                    Text(
+                                        app.categories.takeIf { it.isNotEmpty() }?.joinToString(" · ") { it.title } ?: app.packageName,
+                                        style = MaterialTheme.typography.bodySmall,
+                                    )
                                 }
                             }
                         }
                     }
                     "edit" -> {
-                        Heading("A limit on your terms.", "Set a daily limit for $selectedLabel. Usage resets at midnight in your phone's local time.")
+                        val category = selectedCategoryRule?.let { AppCategoryPreset.valueOf(it) }
+                        Heading(
+                            "A limit on your terms.",
+                            if (category == null) "Set a daily limit for $selectedLabel. Usage resets at midnight in your phone's local time."
+                            else "Set one shared daily limit for every ${category.title.lowercase()} app. Usage resets at midnight in your phone's local time.",
+                        )
                         OutlinedTextField(
                             value = draftMinutes,
                             onValueChange = { draftMinutes = it.filter(Char::isDigit).take(4) },
@@ -268,8 +330,13 @@ private fun ScreenOfficerApp(lifecycle: Lifecycle) {
                                 validation = true
                                 val minutes = draftMinutes.toIntOrNull()
                                 if (minutes != null && minutes in 1..1440 && draftMessage.isNotBlank()) {
-                                    val rule = AppRule(selectedPackage, selectedLabel, minutes, draftMessage.trim(), BlockMode.valueOf(draftMode), draftEnabled)
-                                    changeRule({ store.save(rule) }, "Limit saved for $selectedLabel.")
+                                    if (category == null) {
+                                        val rule = AppRule(selectedPackage, selectedLabel, minutes, draftMessage.trim(), BlockMode.valueOf(draftMode), draftEnabled)
+                                        changeRule({ store.save(rule) }, "Limit saved for $selectedLabel.")
+                                    } else {
+                                        val rule = CategoryRule(category, minutes, draftMessage.trim(), BlockMode.valueOf(draftMode), draftEnabled)
+                                        changeRule({ store.save(rule) }, "Shared limit saved for ${category.title}.")
+                                    }
                                 }
                             },
                             enabled = !saving, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp),
@@ -295,7 +362,7 @@ private fun ScreenOfficerApp(lifecycle: Lifecycle) {
                             TextButton(onClick = { refreshVersion++ }, modifier = Modifier.heightIn(min = 48.dp)) { Text(if (refreshing) "Updating…" else "Refresh") }
                         }
                         snapshot?.error?.takeIf { it.isNotBlank() }?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error) }
-                        if (rules.isEmpty()) {
+                        if (rules.isEmpty() && categoryRules.isEmpty()) {
                             Text("No limits yet. Add an app to begin tracking its daily use.")
                         }
                         rules.forEach { rule ->
@@ -307,11 +374,23 @@ private fun ScreenOfficerApp(lifecycle: Lifecycle) {
                                 enabled = !saving,
                             )
                         }
-                        Button(onClick = { search = ""; screen = "picker"; notice = null }, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) { Text("Add an app") }
+                        categoryRules.forEach { rule ->
+                            RuleCard(
+                                AppRule(rule.id, "${rule.label} (shared)", rule.limitMinutes, rule.message, rule.mode, rule.enabled),
+                                snapshot?.usageMs?.let { usage ->
+                                    apps.filter { rule.category in it.categories }.sumOf { usage[it.packageName] ?: 0L }
+                                }?.takeIf { snapshot?.available == true && usageAllowed },
+                                onEdit = { editCategory(rule.category) },
+                                onToggle = { changeRule({ store.save(rule.copy(enabled = !rule.enabled)) }, if (rule.enabled) "${rule.label} limit paused." else "${rule.label} limit resumed.") },
+                                onRemove = { changeRule({ store.removeCategory(rule.category) }, "Shared limit removed for ${rule.label}.") },
+                                enabled = !saving,
+                            )
+                        }
+                        Button(onClick = { search = ""; categoryFilter = null; screen = "picker"; notice = null }, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) { Text("Add an app") }
                         Text("Soft blocks let you extend use by five minutes. Hard blocks last until midnight. The phone owner can always change these settings.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         HorizontalDivider()
                         Text("Usage and limits stay on this device. ScreenOfficer does not read app content. Android provides the usage history; timing can vary slightly by device.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        if (rules.isNotEmpty()) TextButton(onClick = { clearDialog = true }, enabled = !saving, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("Clear saved limits") }
+                        if (rules.isNotEmpty() || categoryRules.isNotEmpty()) TextButton(onClick = { clearDialog = true }, enabled = !saving, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("Clear saved limits") }
                     }
                 }
                 Spacer(Modifier.height(8.dp))
