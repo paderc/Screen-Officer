@@ -19,8 +19,12 @@ class AppCatalog(private val context: Context) {
         return context.packageManager.queryIntentActivities(
             Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0,
         ).asSequence()
-            .filterNot { it.activityInfo.packageName in protectedPackages }
-            .filter { it.activityInfo.packageName in usedSinceLastMonth}
+            .filter {
+                val packageName = it.activityInfo.packageName
+                !(packageName in protectedPackages) &&
+                packageName in usedSinceLastMonth &&
+                !packageName.contains("gov")
+            }
             .map { TrackedApp(it.activityInfo.packageName, it.loadLabel(context.packageManager).toString()) }
             .distinctBy { it.packageName }
             .sortedWith(compareBy({ it.label.lowercase(Locale.getDefault()) }, { it.packageName }))
