@@ -7,7 +7,9 @@ Authors:
 - Mateusz Pstrągowski
 
 TODO:
-
+  Igor: 
+    - Refresh/updating remove
+    - Clear 1 app limit
 BUGS:
 - When coming back to the application from running app catalogue, the block fails.
 
@@ -19,9 +21,7 @@ Future:
 - Advancing UI for permmissions.
 - Notification in case of disabled permissions on app enter.
 - Website blocking.
-- Refresh/updating remove
 - Back button
 - Checkboxes for app selection
 - History tab
-- Clear 1 app limit
 - Blocking be small window with app in bg
