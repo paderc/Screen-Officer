@@ -151,9 +151,11 @@ class AppBlockingService : AccessibilityService() {
             if (!freshHint && snapshot.available) foregroundHint = snapshot.foregroundPackage
             // A window event can precede the corresponding UsageEvents event slightly.
             val exceeded = if (snapshot.available && canDisplay() && snapshot.foregroundPackage == current) {
-                BlockPolicy.exceededLimit(limits, current, snapshot.usageMs) {
-                    store.snoozeThreshold(it, snapshot.checkedAtMs)
-                }
+                BlockPolicy.exceededLimit(
+                    limits, current, snapshot.usageMs,
+                    snoozeThreshold = { store.snoozeThreshold(it, snapshot.checkedAtMs) },
+                    usageOffset = { store.usageOffset(it, snapshot.checkedAtMs) },
+                )
             } else null
             if (exceeded != null && current != null) {
                 showOverlay(exceeded, current, snapshot)
@@ -182,7 +184,7 @@ class AppBlockingService : AccessibilityService() {
             return
         }
         hideOverlay()
-        val measuredMs = limit.usedMs(snapshot.usageMs)
+        val measuredMs = limit.usedMs(snapshot.usageMs, store.usageOffset(rule.id, snapshot.checkedAtMs))
         val viewContext = ContextThemeWrapper(this, android.R.style.Theme_Material_Light_NoActionBar)
         val content = LinearLayout(viewContext).apply {
             orientation = LinearLayout.VERTICAL
@@ -230,7 +232,11 @@ class AppBlockingService : AccessibilityService() {
                     val fresh = withContext(Dispatchers.IO) { usage.snapshot(limit.packages) }
                     if (overlayKey != key) return@launch
                     if (fresh.available && fresh.dayStartMs == key.dayStart && version == stateVersion) {
-                        store.snooze(rule.id, limit.usedMs(fresh.usageMs), rule.mode, rule.enabled, fresh.checkedAtMs)
+                        store.snooze(
+                            rule.id,
+                            limit.usedMs(fresh.usageMs, store.usageOffset(rule.id, fresh.checkedAtMs)),
+                            rule.mode, rule.enabled, fresh.checkedAtMs,
+                        )
                         hideOverlay()
                     } else {
                         clicked.isEnabled = true

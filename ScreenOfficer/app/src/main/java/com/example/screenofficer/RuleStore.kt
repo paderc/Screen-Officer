@@ -78,6 +78,8 @@ class RuleStore(context: Context) {
             .remove(RULE_PREFIX + id)
             .remove(SNOOZE_DAY_PREFIX + id)
             .remove(SNOOZE_USAGE_PREFIX + id)
+            .remove(RESET_DAY_PREFIX + id)
+            .remove(RESET_USAGE_PREFIX + id)
             .apply()
     }
 
@@ -87,6 +89,8 @@ class RuleStore(context: Context) {
             .remove(CATEGORY_RULE_PREFIX + category.name)
             .remove(SNOOZE_DAY_PREFIX + id)
             .remove(SNOOZE_USAGE_PREFIX + id)
+            .remove(RESET_DAY_PREFIX + id)
+            .remove(RESET_USAGE_PREFIX + id)
             .apply()
     }
 
@@ -105,6 +109,25 @@ class RuleStore(context: Context) {
             return null
         }
         return preferences.getLong(SNOOZE_USAGE_PREFIX + id, 0L).takeIf { it > 0L }
+    }
+
+    /**
+     * Zero the current usage for [id] for the rest of today. The raw measurement
+     * stays intact; [usageOffset] is subtracted wherever the limit is evaluated or
+     * displayed, so History continues to reflect the true total.
+     */
+    fun resetUsage(id: String, measuredUsageMs: Long, now: Long = System.currentTimeMillis()) {
+        preferences.edit()
+            .putLong(RESET_DAY_PREFIX + id, localDayStart(now))
+            .putLong(RESET_USAGE_PREFIX + id, measuredUsageMs.coerceAtLeast(0L))
+            .remove(SNOOZE_DAY_PREFIX + id)
+            .remove(SNOOZE_USAGE_PREFIX + id)
+            .apply()
+    }
+
+    fun usageOffset(id: String, now: Long = System.currentTimeMillis()): Long {
+        if (preferences.getLong(RESET_DAY_PREFIX + id, Long.MIN_VALUE) != localDayStart(now)) return 0L
+        return preferences.getLong(RESET_USAGE_PREFIX + id, 0L)
     }
 
     fun clear() {
@@ -137,6 +160,8 @@ class RuleStore(context: Context) {
         const val CATEGORY_RULE_PREFIX = "category.rule."
         const val SNOOZE_DAY_PREFIX = "snooze.day."
         const val SNOOZE_USAGE_PREFIX = "snooze.usage."
+        const val RESET_DAY_PREFIX = "reset.day."
+        const val RESET_USAGE_PREFIX = "reset.usage."
         const val FIVE_MINUTES_MS = 300_000L
     }
 }

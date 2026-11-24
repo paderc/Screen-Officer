@@ -37,7 +37,6 @@ import com.anhaki.picktime.utils.PickTimeFocusIndicator
 import com.anhaki.picktime.utils.PickTimeTextStyle
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.UUID
@@ -116,43 +115,41 @@ private fun ScreenOfficerApp(lifecycle: Lifecycle) {
     var clearDialog by rememberSaveable { mutableStateOf(false) }
     var limitToClear by rememberSaveable { mutableStateOf<String?>(null) }
 
-    DisposableEffect(lifecycle) {
-        val observer = LifecycleEventObserver { _, _ ->
+    DisposableEffect(lifecycle, store) {
+        val lifecycleObserver = LifecycleEventObserver { _, event ->
             resumed = lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
+            if (event == Lifecycle.Event.ON_START) refreshVersion++
         }
-        lifecycle.addObserver(observer)
-        onDispose { lifecycle.removeObserver(observer) }
+        val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> refreshVersion++ }
+        lifecycle.addObserver(lifecycleObserver)
+        store.preferences.registerOnSharedPreferenceChangeListener(prefListener)
+        onDispose {
+            lifecycle.removeObserver(lifecycleObserver)
+            store.preferences.unregisterOnSharedPreferenceChangeListener(prefListener)
+        }
     }
-    DisposableEffect(store) {
-        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> refreshVersion++ }
-        store.preferences.registerOnSharedPreferenceChangeListener(listener)
-        onDispose { store.preferences.unregisterOnSharedPreferenceChangeListener(listener) }
-    }
-    LaunchedEffect(resumed, refreshVersion, apps) {
+    LaunchedEffect(refreshVersion, apps) {
         if (!resumed) return@LaunchedEffect
-        do {
-            try {
-                val result = withContext(Dispatchers.IO) {
-                    val currentRules = store.allRules()
-                    val currentCategories = store.allCategoryRules()
-                    val trackedPackages = currentRules.flatMap { it.packages }.toSet() +
+        try {
+            val result = withContext(Dispatchers.IO) {
+                val currentRules = store.allRules()
+                val currentCategories = store.allCategoryRules()
+                val trackedPackages = currentRules.flatMap { it.packages }.toSet() +
                         currentCategories.flatMap { it.asTarget(apps).packages }
-                    Triple(SavedRules(currentRules, currentCategories), repository.hasAccess(), repository.snapshot(trackedPackages))
-                }
-                rules = result.first.apps
-                categoryRules = result.first.categories
-                usageAllowed = result.second
-                snapshot = result.third
-                serviceConnected = AppBlockingService.connected
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (_: Exception) {
-                snapshot = null
-                usageAllowed = false
-                serviceConnected = AppBlockingService.connected
+                Triple(SavedRules(currentRules, currentCategories), repository.hasAccess(), repository.snapshot(trackedPackages))
             }
-            delay(3_000)
-        } while (resumed)
+            rules = result.first.apps
+            categoryRules = result.first.categories
+            usageAllowed = result.second
+            snapshot = result.third
+            serviceConnected = AppBlockingService.connected
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            snapshot = null
+            usageAllowed = false
+            serviceConnected = AppBlockingService.connected
+        }
     }
     LaunchedEffect(resumed) {
         if (!resumed) return@LaunchedEffect
@@ -331,7 +328,7 @@ private fun ScreenOfficerApp(lifecycle: Lifecycle) {
                         appsError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
                         val matching = apps.filter {
                             (selectedCategory == null || selectedCategory in it.categories) &&
-                                (it.label.contains(search, true) || it.packageName.contains(search, true))
+                                    (it.label.contains(search, true) || it.packageName.contains(search, true))
                         }
                         if (!appsLoading && matching.isEmpty()) {
                             if (usageAllowed) {
@@ -424,7 +421,6 @@ private fun ScreenOfficerApp(lifecycle: Lifecycle) {
                         history = history?.takeIf { it.dayStartMs == historyDay },
                         usageAllowed = usageAllowed,
                         onDayChange = { historyDaysAgo = it },
-                        onRefresh = { refreshVersion++ },
                         onEnableUsage = { permissionDialog = "usage" },
                     )
                     Screen.LIMITS -> {
@@ -434,10 +430,7 @@ private fun ScreenOfficerApp(lifecycle: Lifecycle) {
                             onUsage = { permissionDialog = "usage" },
                             onBlocking = { permissionDialog = "blocking" },
                         )
-                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                            Text("Today", Modifier.weight(1f), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
-                            TextButton(onClick = { refreshVersion++ }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Refresh") }
-                        }
+                        Text("Today", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
                         snapshot?.error?.takeIf { it.isNotBlank() }?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error) }
                         if (rules.isEmpty() && categoryRules.isEmpty()) {
                             Text("No limits yet. Add a limit for one app or a group.")
@@ -445,24 +438,56 @@ private fun ScreenOfficerApp(lifecycle: Lifecycle) {
                         val todayUsage = snapshot?.takeIf { it.available && usageAllowed }?.usageMs
                         rules.forEach { rule ->
                             val target = LimitTarget(rule)
+                            val usable = todayUsage?.takeIf { it.keys.containsAll(target.packages) }
+                            val offset = store.usageOffset(rule.id)
                             RuleCard(
                                 rule,
-                                todayUsage?.takeIf { it.keys.containsAll(target.packages) }?.let(target::usedMs),
+                                usedMs = usable?.let { target.usedMs(it, offset) },
                                 members = rule.sharedApps.values.takeIf { it.isNotEmpty() }?.joinToString(", "),
                                 onEdit = { editRule(rule) },
-                                onToggle = { changeRule({ store.save(rule.copy(enabled = !rule.enabled)) }, if (rule.enabled) "${rule.label} limit paused." else "${rule.label} limit resumed.") },
+                                onToggle = {
+                                    changeRule(
+                                        { store.save(rule.copy(enabled = !rule.enabled)) },
+                                        if (rule.enabled) "${rule.label} limit paused." else "${rule.label} limit resumed.",
+                                    )
+                                },
+                                onResetUsage = {
+                                    val raw = usable?.let { target.usedMs(it) }
+                                    if (raw != null && raw > 0L) {
+                                        changeRule(
+                                            action = { store.resetUsage(rule.id, raw) },
+                                            success = "Today's ${rule.label} usage reset.",
+                                        )
+                                    }
+                                },
                                 onClear = { limitToClear = rule.id },
                                 enabled = !saving,
                             )
                         }
                         categoryRules.forEach { rule ->
                             val target = rule.asTarget(apps)
+                            val usable = todayUsage?.takeIf { it.keys.containsAll(target.packages) }
+                            val offset = store.usageOffset(rule.id)
                             RuleCard(
                                 target.rule,
-                                todayUsage?.takeIf { it.keys.containsAll(target.packages) }?.let(target::usedMs),
+                                usedMs = usable?.let { target.usedMs(it, offset) },
                                 members = "Shared across ${rule.label.lowercase()} apps",
                                 onEdit = { editCategory(rule.category) },
-                                onToggle = { changeRule({ store.save(rule.copy(enabled = !rule.enabled)) }, if (rule.enabled) "${rule.label} limit paused." else "${rule.label} limit resumed.") },
+                                onToggle = {
+                                    changeRule(
+                                        { store.save(rule.copy(enabled = !rule.enabled)) },
+                                        if (rule.enabled) "${rule.label} limit paused." else "${rule.label} limit resumed.",
+                                    )
+                                },
+                                onResetUsage = {
+                                    val raw = usable?.let { target.usedMs(it) }
+                                    if (raw != null && raw > 0L) {
+                                        changeRule(
+                                            action = { store.resetUsage(rule.id, raw) },
+                                            success = "Today's ${rule.label} usage reset.",
+                                        )
+                                    }
+                                },
                                 onClear = { limitToClear = rule.id },
                                 enabled = !saving,
                             )
@@ -632,6 +657,7 @@ private fun RuleCard(
     members: String?,
     onEdit: () -> Unit,
     onToggle: () -> Unit,
+    onResetUsage: () -> Unit,
     onClear: () -> Unit,
     enabled: Boolean,
 ) {
@@ -649,6 +675,11 @@ private fun RuleCard(
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 TextButton(onClick = onEdit, enabled = enabled, modifier = Modifier.heightIn(min = 48.dp).semantics { contentDescription = "Edit limit for ${rule.label}" }) { Text("Edit") }
                 TextButton(onClick = onToggle, enabled = enabled, modifier = Modifier.heightIn(min = 48.dp).semantics { contentDescription = "${if (rule.enabled) "Pause" else "Resume"} limit for ${rule.label}" }) { Text(if (rule.enabled) "Pause" else "Resume") }
+                TextButton(
+                    onClick = onResetUsage,
+                    enabled = enabled && usedMs != null && usedMs > 0L,
+                    modifier = Modifier.heightIn(min = 48.dp).semantics { contentDescription = "Reset today's usage for ${rule.label}" },
+                ) { Text("Reset usage") }
                 TextButton(onClick = onClear, enabled = enabled, modifier = Modifier.heightIn(min = 48.dp).semantics { contentDescription = "Clear limit for ${rule.label}" }) { Text("Clear limit") }
             }
         }
@@ -658,4 +689,3 @@ internal fun formatUsage(millis: Long): String {
     val seconds = millis.coerceAtLeast(0) / 1_000
     return if (seconds < 60) "$seconds sec" else "${seconds / 60} min ${seconds % 60} sec"
 }
-

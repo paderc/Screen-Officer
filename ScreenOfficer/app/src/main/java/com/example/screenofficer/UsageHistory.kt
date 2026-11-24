@@ -31,7 +31,6 @@ internal fun UsageHistory(
     history: DailyUsage?,
     usageAllowed: Boolean,
     onDayChange: (Int) -> Unit,
-    onRefresh: () -> Unit,
     onEnableUsage: () -> Unit,
 ) {
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -41,7 +40,6 @@ internal fun UsageHistory(
             style = MaterialTheme.typography.headlineMedium,
             fontWeight = FontWeight.SemiBold,
         )
-        TextButton(onClick = onRefresh, modifier = Modifier.heightIn(min = 48.dp)) { Text("Refresh") }
     }
 
     val date = remember(dayStart) { DateFormat.getDateInstance(DateFormat.FULL).format(Date(dayStart)) }

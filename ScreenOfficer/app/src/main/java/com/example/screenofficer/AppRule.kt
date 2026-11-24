@@ -44,7 +44,8 @@ data class CategoryRule(
 }
 
 internal data class LimitTarget(val rule: AppRule, val packages: Set<String> = rule.packages) {
-    fun usedMs(usage: Map<String, Long>): Long = packages.sumOf { usage[it] ?: 0L }
+    fun usedMs(usage: Map<String, Long>, offsetMs: Long = 0L): Long =
+        (packages.sumOf { usage[it] ?: 0L } - offsetMs).coerceAtLeast(0L)
 }
 
 object BlockPolicy {
@@ -64,11 +65,12 @@ object BlockPolicy {
         foregroundPackage: String?,
         usage: Map<String, Long>,
         snoozeThreshold: (String) -> Long?,
+        usageOffset: (String) -> Long = { 0L },
     ): LimitTarget? {
         if (foregroundPackage == null) return null
         return limits.asSequence()
             .filter { foregroundPackage in it.packages }
-            .filter { shouldBlock(it.rule, it.usedMs(usage), snoozeThreshold(it.rule.id)) }
+            .filter { shouldBlock(it.rule, it.usedMs(usage, usageOffset(it.rule.id)), snoozeThreshold(it.rule.id)) }
             .minByOrNull { if (it.rule.mode == BlockMode.HARD) 0 else 1 }
     }
 }
