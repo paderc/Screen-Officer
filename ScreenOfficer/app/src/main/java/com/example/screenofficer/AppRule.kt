@@ -11,13 +11,18 @@ data class TrackedApp(
 enum class BlockMode { SOFT, HARD }
 
 data class AppRule(
+    // Single-app rules use the package name as their ID.
     val packageName: String,
     val label: String,
     val limitMinutes: Int = 30,
     val message: String = DEFAULT_MESSAGE,
     val mode: BlockMode = BlockMode.SOFT,
     val enabled: Boolean = true,
-)
+    val sharedApps: Map<String, String> = emptyMap(),
+) {
+    val id: String get() = packageName
+    val packages: Set<String> get() = sharedApps.keys.ifEmpty { setOf(packageName) }
+}
 
 /** A single allowance shared by every installed app recognised in this category. */
 data class CategoryRule(
@@ -29,6 +34,17 @@ data class CategoryRule(
 ) {
     val id: String get() = "category.${category.name}"
     val label: String get() = category.title
+
+    internal fun asAppRule(): AppRule = AppRule(id, label, limitMinutes, message, mode, enabled)
+
+    internal fun asTarget(apps: List<TrackedApp>): LimitTarget = LimitTarget(
+        asAppRule(),
+        apps.filter { category in it.categories }.map { it.packageName }.toSet(),
+    )
+}
+
+internal data class LimitTarget(val rule: AppRule, val packages: Set<String> = rule.packages) {
+    fun usedMs(usage: Map<String, Long>): Long = packages.sumOf { usage[it] ?: 0L }
 }
 
 object BlockPolicy {
@@ -41,5 +57,18 @@ object BlockPolicy {
             dailyLimitMs
         }
         return usedMs >= thresholdMs
+    }
+
+    internal fun exceededLimit(
+        limits: List<LimitTarget>,
+        foregroundPackage: String?,
+        usage: Map<String, Long>,
+        snoozeThreshold: (String) -> Long?,
+    ): LimitTarget? {
+        if (foregroundPackage == null) return null
+        return limits.asSequence()
+            .filter { foregroundPackage in it.packages }
+            .filter { shouldBlock(it.rule, it.usedMs(usage), snoozeThreshold(it.rule.id)) }
+            .minByOrNull { if (it.rule.mode == BlockMode.HARD) 0 else 1 }
     }
 }

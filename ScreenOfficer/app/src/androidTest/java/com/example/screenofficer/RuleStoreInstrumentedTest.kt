@@ -41,7 +41,7 @@ class RuleStoreInstrumentedTest {
 
     @Test fun snoozePersistsForTodayWithoutChangingDailyGoalAndResetsTomorrow() {
         store.save(rule)
-        store.snooze(rule.packageName, usedMs, today)
+        store.snooze(rule.id, usedMs, rule.mode, rule.enabled, today)
         val reloaded = RuleStore(context)
         assertEquals(usedMs + 300_000L, reloaded.snoozeThreshold(rule.packageName, today))
         assertEquals(rule, reloaded.allRules().single())
@@ -53,14 +53,15 @@ class RuleStoreInstrumentedTest {
     }
 
     @Test fun hardBlockCannotReceiveASnooze() {
-        store.save(rule.copy(mode = BlockMode.HARD))
-        store.snooze(rule.packageName, usedMs, today)
+        val hard = rule.copy(mode = BlockMode.HARD)
+        store.save(hard)
+        store.snooze(hard.id, usedMs, hard.mode, hard.enabled, today)
         assertNull(store.snoozeThreshold(rule.packageName, today))
     }
 
     @Test fun savingAChangedGoalClearsTheExtension() {
         store.save(rule)
-        store.snooze(rule.packageName, usedMs, today)
+        store.snooze(rule.id, usedMs, rule.mode, rule.enabled, today)
         store.save(rule.copy(limitMinutes = 45))
         assertNull(store.snoozeThreshold(rule.packageName, today))
         assertEquals(45, store.allRules().single().limitMinutes)
@@ -86,14 +87,34 @@ class RuleStoreInstrumentedTest {
 
     @Test fun removingOrClearingRulesAlsoClearsSnoozes() {
         store.save(rule)
-        store.snooze(rule.packageName, usedMs, today)
+        store.snooze(rule.id, usedMs, rule.mode, rule.enabled, today)
         store.remove(rule.packageName)
         assertTrue(store.allRules().isEmpty())
         assertNull(store.snoozeThreshold(rule.packageName, today))
         store.save(rule)
-        store.snooze(rule.packageName, usedMs, today)
+        store.snooze(rule.id, usedMs, rule.mode, rule.enabled, today)
         store.clear()
         assertTrue(RuleStore(context).allRules().isEmpty())
         assertNull(RuleStore(context).snoozeThreshold(rule.packageName, today))
+    }
+
+    @Test fun clearingOneSharedLimitLeavesOtherLimitsAndTheirExtensions() {
+        val group = rule.copy(
+            packageName = "group.test",
+            label = "Shared limit",
+            sharedApps = mapOf(rule.packageName to rule.label, "test.second.app" to "Second app"),
+        )
+        store.save(rule)
+        store.save(group)
+        store.snooze(rule.id, usedMs, rule.mode, rule.enabled, today)
+        store.snooze(group.id, usedMs, group.mode, group.enabled, today)
+        val reloaded = RuleStore(context)
+        assertEquals(group, reloaded.allRules().single { it.id == group.id })
+
+        reloaded.remove(group.id)
+
+        assertEquals(listOf(rule), store.allRules())
+        assertEquals(usedMs + 300_000L, store.snoozeThreshold(rule.id, today))
+        assertNull(store.snoozeThreshold(group.id, today))
     }
 }

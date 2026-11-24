@@ -7,8 +7,10 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.SharedPreferences
+import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.drawable.GradientDrawable
 import android.os.PowerManager
 import android.os.SystemClock
 import android.view.ContextThemeWrapper
@@ -19,6 +21,7 @@ import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.inputmethod.InputMethodManager
 import android.widget.Button
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -35,33 +38,31 @@ import kotlinx.coroutines.withTimeoutOrNull
 
 /** Observes package changes only; it never reads app text, views, or screenshots. */
 class AppBlockingService : AccessibilityService() {
-    private data class BlockingRules(
-        val rules: List<AppRule>,
-        val members: Map<String, Set<String>>,
-    )
     private var scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val changes = Channel<Unit>(Channel.CONFLATED)
     private lateinit var store: RuleStore
     private lateinit var usage: UsageRepository
+    private lateinit var blockedUsage: BlockedUsageStore
     private lateinit var windowManager: WindowManager
     private var registered = false
     private var foregroundHint: String? = null
     private var foregroundHintAt = 0L
-    private var foregroundVersion = 0L
+    private var stateVersion = 0L
     private var inputMethodPackages: Set<String> = emptySet()
     private var overlay: View? = null
     private var overlayKey: OverlayKey? = null
 
-    private data class OverlayKey(val rule: AppRule, val dayStart: Long)
+    private data class OverlayKey(val rule: AppRule, val foregroundPackage: String, val dayStart: Long)
 
     private val preferenceListener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+        stateVersion++
         changes.trySend(Unit)
     }
 
     private val deviceReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == Intent.ACTION_INPUT_METHOD_CHANGED) refreshInputMethods()
-            foregroundVersion++
+            stateVersion++
             foregroundHint = null
             hideOverlay()
             changes.trySend(Unit)
@@ -75,6 +76,7 @@ class AppBlockingService : AccessibilityService() {
         connected = true
         store = RuleStore(this)
         usage = UsageRepository(this)
+        blockedUsage = BlockedUsageStore(this)
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         refreshInputMethods()
         store.preferences.registerOnSharedPreferenceChangeListener(preferenceListener)
@@ -109,48 +111,35 @@ class AppBlockingService : AccessibilityService() {
         ) return
         foregroundHint = packageName
         foregroundHintAt = SystemClock.elapsedRealtime()
-        foregroundVersion++
-        if (overlayKey?.rule?.packageName != packageName) hideOverlay()
+        stateVersion++
+        if (overlayKey?.foregroundPackage != packageName) hideOverlay()
         changes.trySend(Unit)
     }
 
     private suspend fun monitor() {
         while (scope.isActive) {
-            val blockingRules = withContext(Dispatchers.IO) {
-                val apps = AppCatalog(this@AppBlockingService).loadApps()
-                val appRules = store.allRules()
-                    .filter { it.enabled && !SafetyApps.isProtected(this@AppBlockingService, it.packageName) }
-                val categoryRules = store.allCategoryRules().filter { it.enabled }.map { categoryRule ->
-                    AppRule(
-                        packageName = categoryRule.id,
-                        label = "${categoryRule.label} (shared)",
-                        limitMinutes = categoryRule.limitMinutes,
-                        message = categoryRule.message,
-                        mode = categoryRule.mode,
-                        enabled = categoryRule.enabled,
-                    ) to apps.filter { categoryRule.category in it.categories }.map { it.packageName }.toSet()
+            val version = stateVersion
+            val limits = withContext(Dispatchers.IO) {
+                val protected = SafetyApps.protectedPackages(this@AppBlockingService)
+                val appLimits = store.allRules().filter { it.enabled }.map { rule ->
+                    LimitTarget(rule, rule.packages - protected)
                 }
-                BlockingRules(
-                    rules = appRules + categoryRules.map { it.first },
-                    members = buildMap {
-                        appRules.forEach { put(it.packageName, setOf(it.packageName)) }
-                        categoryRules.forEach { (rule, packages) -> put(rule.packageName, packages) }
-                    },
-                )
+                val categoryRules = store.allCategoryRules().filter { it.enabled }
+                val apps = if (categoryRules.isEmpty()) emptyList() else AppCatalog(this@AppBlockingService).loadApps()
+                appLimits + categoryRules.map { it.asTarget(apps) }
             }
-            val rules = blockingRules.rules
-            if (rules.isEmpty() || !canDisplay()) {
+            if (version != stateVersion) continue
+            if (limits.isEmpty() || !canDisplay()) {
                 hideOverlay()
                 // Package events, rule edits and unlock broadcasts wake an idle service.
                 changes.receive()
                 continue
             }
             val hint = foregroundHint
-            val version = foregroundVersion
             val snapshot = withContext(Dispatchers.IO) {
-                usage.snapshot(blockingRules.members.values.flatten().toSet())
+                usage.snapshot(limits.flatMap { it.packages }.toSet())
             }
-            if (version != foregroundVersion) continue
+            if (version != stateVersion) continue
             // Window events can be transient dialogs and may never be followed by another
             // package event when that dialog closes. Reconcile them with measured resumed
             // activity state instead of trusting an untracked hint indefinitely. A short
@@ -160,20 +149,19 @@ class AppBlockingService : AccessibilityService() {
             val freshHint = hint != null && SystemClock.elapsedRealtime() - foregroundHintAt < graceMs
             val current = if (freshHint) hint else snapshot.foregroundPackage
             if (!freshHint && snapshot.available) foregroundHint = snapshot.foregroundPackage
-            val rule = rules.firstOrNull { current != null && current in (blockingRules.members[it.packageName] ?: emptySet()) }
-            val measured = rule?.let { candidate ->
-                blockingRules.members[candidate.packageName].orEmpty().sumOf { snapshot.usageMs[it] ?: 0L }
-            } ?: 0L
-            if (snapshot.available && canDisplay() && rule != null &&
-                // A window event can precede the corresponding UsageEvents event slightly.
-                snapshot.foregroundPackage == current &&
-                BlockPolicy.shouldBlock(rule, measured, store.snoozeThreshold(rule.packageName))
-            ) {
-                showOverlay(rule, measured, snapshot.dayStartMs, blockingRules.members)
+            // A window event can precede the corresponding UsageEvents event slightly.
+            val exceeded = if (snapshot.available && canDisplay() && snapshot.foregroundPackage == current) {
+                BlockPolicy.exceededLimit(limits, current, snapshot.usageMs) {
+                    store.snoozeThreshold(it, snapshot.checkedAtMs)
+                }
+            } else null
+            if (exceeded != null && current != null) {
+                showOverlay(exceeded, current, snapshot)
             } else {
                 hideOverlay()
             }
-            withTimeoutOrNull(if (rule != null && snapshot.available) 1_000L else 5_000L) { changes.receive() }
+            val trackingForeground = snapshot.available && current != null && limits.any { current in it.packages }
+            withTimeoutOrNull(if (trackingForeground) 1_000L else 5_000L) { changes.receive() }
         }
     }
 
@@ -186,15 +174,19 @@ class AppBlockingService : AccessibilityService() {
         (getSystemService(POWER_SERVICE) as PowerManager).isInteractive &&
             !(getSystemService(KEYGUARD_SERVICE) as KeyguardManager).isKeyguardLocked
 
-    private fun showOverlay(rule: AppRule, measuredMs: Long, dayStart: Long, members: Map<String, Set<String>>) {
-        val key = OverlayKey(rule, dayStart)
-        if (overlayKey == key && overlay != null) return
+    private fun showOverlay(limit: LimitTarget, foregroundPackage: String, snapshot: UsageSnapshot) {
+        val rule = limit.rule
+        val key = OverlayKey(rule, foregroundPackage, snapshot.dayStartMs)
+        if (overlayKey == key && overlay != null) {
+            blockedUsage.checkpoint()
+            return
+        }
         hideOverlay()
+        val measuredMs = limit.usedMs(snapshot.usageMs)
         val viewContext = ContextThemeWrapper(this, android.R.style.Theme_Material_Light_NoActionBar)
         val content = LinearLayout(viewContext).apply {
             orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(24), dp(28), dp(24), dp(28))
+            setPadding(dp(22), dp(22), dp(22), dp(16))
         }
         fun text(value: String, size: Float, bold: Boolean = false) {
             content.addView(TextView(viewContext).apply {
@@ -202,57 +194,55 @@ class AppBlockingService : AccessibilityService() {
                 textSize = size
                 setTextColor(Color.rgb(22, 61, 54))
                 if (bold) setTypeface(typeface, android.graphics.Typeface.BOLD)
-                setPadding(0, 0, 0, dp(18))
+                setPadding(0, 0, 0, dp(10))
             })
         }
         fun button(value: String, action: (Button) -> Unit) {
             content.addView(Button(viewContext).apply {
                 text = value
                 isAllCaps = false
-                minHeight = dp(52)
+                minHeight = dp(48)
                 setOnClickListener { action(this) }
             }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                bottomMargin = dp(10)
+                bottomMargin = dp(4)
             })
         }
-        text("ScreenOfficer", 18f, true)
-        text(if (rule.mode == BlockMode.HARD) "Daily limit reached." else "Time for a check-in?", 30f, true)
-        text(rule.label, 23f, true)
-        text("${measuredMs / 60_000} min used today · ${rule.limitMinutes} min daily limit", 17f)
-        text(rule.message, 21f)
+        text(if (rule.mode == BlockMode.HARD) "Daily limit reached" else "Time for a check-in?", 23f, true)
+        val limitName = rule.sharedApps[foregroundPackage]?.let { "Shared limit · $it" } ?: rule.label
+        text(limitName, 16f, true)
+        val timeUsed = if (limit.packages.size > 1) "min combined today" else "min used today"
+        text("${measuredMs / 60_000} $timeUsed · ${rule.limitMinutes} min limit", 14f)
+        text(rule.message, 16f)
         text(
             if (rule.mode == BlockMode.HARD)
-                "Hard block: this app is blocked until midnight. You can manage your limit in ScreenOfficer."
-            else "Soft block: take a break or choose five more minutes of app use.",
-            16f,
+                "Blocked until midnight."
+            else "Take a break or continue for five minutes.",
+            14f,
         )
-        button("Take a break · Go home") { goHome() }
+        button("Go home") { goHome() }
         if (rule.mode == BlockMode.SOFT) {
             button("Continue for 5 more minutes") { clicked ->
                 clicked.isEnabled = false
                 scope.launch {
-                    // Use current measured usage, rather than the number displayed when
-                    // this overlay opened. The allowance survives a process restart.
-                    val fresh = withContext(Dispatchers.IO) {
-                        usage.snapshot(members[rule.packageName].orEmpty())
+                    // The snapshot excludes the live blocking interval. Persist the extension
+                    // against that usage before closing the card.
+                    val version = stateVersion
+                    val fresh = withContext(Dispatchers.IO) { usage.snapshot(limit.packages) }
+                    if (overlayKey != key) return@launch
+                    if (fresh.available && fresh.dayStartMs == key.dayStart && version == stateVersion) {
+                        store.snooze(rule.id, limit.usedMs(fresh.usageMs), rule.mode, rule.enabled, fresh.checkedAtMs)
+                        hideOverlay()
+                    } else {
+                        clicked.isEnabled = true
                     }
-                    if (fresh.available && rule.mode == BlockMode.SOFT && rule.enabled) {
-                        withContext(Dispatchers.IO) {
-                            val latestUsed = if (rule.packageName.startsWith("category.")) {
-                                members[rule.packageName].orEmpty().sumOf { fresh.usageMs[it] ?: 0L }
-                            } else fresh.usageMs[rule.packageName] ?: measuredMs
-                            store.snooze(rule.packageName, latestUsed, rule.mode, rule.enabled)
-                        }
-                    }
-                    hideOverlay()
                     changes.trySend(Unit)
                 }
             }
         }
-        button("Manage limits in ScreenOfficer") {
+        button("Manage limits") {
             foregroundHint = packageName
             foregroundHintAt = SystemClock.elapsedRealtime()
-            foregroundVersion++
+            stateVersion++
             hideOverlay()
             startActivity(Intent(this, MainActivity::class.java).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
@@ -260,33 +250,49 @@ class AppBlockingService : AccessibilityService() {
             changes.trySend(Unit)
         }
         val scroller = ScrollView(viewContext).apply {
-            setBackgroundColor(Color.rgb(255, 252, 245))
-            isFillViewport = true
-            fitsSystemWindows = true
-            isFocusableInTouchMode = true
-            addView(content)
-            setOnKeyListener { _, keyCode, event ->
-                if (keyCode == KeyEvent.KEYCODE_BACK) {
-                    if (event.action == KeyEvent.ACTION_UP) goHome()
-                    true
-                } else false
+            background = GradientDrawable().apply {
+                setColor(Color.rgb(255, 252, 245))
+                cornerRadius = dp(22).toFloat()
             }
+            clipToOutline = true
+            elevation = dp(12).toFloat()
+            addView(content)
+        }
+        // The scrim consumes touches outside the card while the blocked app stays visible.
+        val scrim = object : FrameLayout(viewContext) {
+            override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+                if (event.keyCode != KeyEvent.KEYCODE_BACK) return super.dispatchKeyEvent(event)
+                if (event.action == KeyEvent.ACTION_UP) goHome()
+                return true
+            }
+        }.apply {
+            setBackgroundColor(0x66000000)
+            fitsSystemWindows = true
+            isClickable = true
+            isFocusableInTouchMode = true
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            val width = minOf(360, (resources.configuration.screenWidthDp - 40).coerceAtLeast(1))
+            addView(scroller, FrameLayout.LayoutParams(dp(width), FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER).apply {
+                topMargin = dp(16)
+                bottomMargin = dp(16)
+            })
         }
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-            0,
-            PixelFormat.OPAQUE,
+            WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM,
+            PixelFormat.TRANSLUCENT,
         ).apply {
             gravity = Gravity.CENTER
             title = "ScreenOfficer daily limit"
         }
         try {
-            windowManager.addView(scroller, params)
-            overlay = scroller
+            windowManager.addView(scrim, params)
+            overlay = scrim
             overlayKey = key
-            scroller.requestFocus()
+            blockedUsage.start(foregroundPackage)
+            scrim.requestFocus()
             scroller.announceForAccessibility("${rule.label}. Daily limit reached. ${rule.message}")
         } catch (_: WindowManager.BadTokenException) {
             // Android may detach the service while a check is completing.
@@ -296,11 +302,18 @@ class AppBlockingService : AccessibilityService() {
         }
     }
 
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        stateVersion++
+        hideOverlay()
+        changes.trySend(Unit)
+    }
+
     private fun goHome() {
         // Suppress checks until the HOME transition supplies its new foreground package.
         foregroundHint = packageName
         foregroundHintAt = SystemClock.elapsedRealtime()
-        foregroundVersion++
+        stateVersion++
         hideOverlay()
         if (!performGlobalAction(GLOBAL_ACTION_HOME)) {
             startActivity(Intent(Intent.ACTION_MAIN).apply {
@@ -320,6 +333,8 @@ class AppBlockingService : AccessibilityService() {
                 windowManager.removeViewImmediate(old)
             } catch (_: IllegalArgumentException) {
                 // Window already removed as the service was detached.
+            } finally {
+                blockedUsage.stop()
             }
         }
     }

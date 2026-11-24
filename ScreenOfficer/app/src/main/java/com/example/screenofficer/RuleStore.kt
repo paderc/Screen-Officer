@@ -5,7 +5,7 @@ import android.content.SharedPreferences
 import org.json.JSONObject
 import java.util.Calendar
 
-/** Only selected apps and their settings are persisted; Android owns the usage history. */
+/** Persists selected apps, limit settings and soft-block extensions. */
 class RuleStore(context: Context) {
     val preferences: SharedPreferences = context.applicationContext
         .getSharedPreferences("screenofficer_rules", Context.MODE_PRIVATE)
@@ -14,6 +14,7 @@ class RuleStore(context: Context) {
         if (!key.startsWith(RULE_PREFIX) || value !is String) return@mapNotNull null
         runCatching {
             val json = JSONObject(value)
+            val sharedApps = if (json.has("apps")) json.getJSONObject("apps") else null
             AppRule(
                 packageName = key.removePrefix(RULE_PREFIX),
                 label = json.getString("label"),
@@ -21,6 +22,9 @@ class RuleStore(context: Context) {
                 message = json.getString("message"),
                 mode = BlockMode.valueOf(json.getString("mode")),
                 enabled = json.optBoolean("enabled", true),
+                sharedApps = sharedApps?.let { apps ->
+                    apps.keys().asSequence().associateWith(apps::getString)
+                }.orEmpty(),
             ).also(::validate)
         }.getOrNull()
     }.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.label })
@@ -33,10 +37,11 @@ class RuleStore(context: Context) {
             .put("message", rule.message.trim())
             .put("mode", rule.mode.name)
             .put("enabled", rule.enabled)
+        if (rule.sharedApps.isNotEmpty()) json.put("apps", JSONObject(rule.sharedApps))
         preferences.edit()
-            .putString(RULE_PREFIX + rule.packageName, json.toString())
-            .remove(SNOOZE_DAY_PREFIX + rule.packageName)
-            .remove(SNOOZE_USAGE_PREFIX + rule.packageName)
+            .putString(RULE_PREFIX + rule.id, json.toString())
+            .remove(SNOOZE_DAY_PREFIX + rule.id)
+            .remove(SNOOZE_USAGE_PREFIX + rule.id)
             .apply()
     }
 
@@ -68,11 +73,11 @@ class RuleStore(context: Context) {
             .apply()
     }
 
-    fun remove(packageName: String) {
+    fun remove(id: String) {
         preferences.edit()
-            .remove(RULE_PREFIX + packageName)
-            .remove(SNOOZE_DAY_PREFIX + packageName)
-            .remove(SNOOZE_USAGE_PREFIX + packageName)
+            .remove(RULE_PREFIX + id)
+            .remove(SNOOZE_DAY_PREFIX + id)
+            .remove(SNOOZE_USAGE_PREFIX + id)
             .apply()
     }
 
@@ -95,11 +100,11 @@ class RuleStore(context: Context) {
             .apply()
     }
 
-    fun snoozeThreshold(packageName: String, now: Long = System.currentTimeMillis()): Long? {
-        if (preferences.getLong(SNOOZE_DAY_PREFIX + packageName, Long.MIN_VALUE) != localDayStart(now)) {
+    fun snoozeThreshold(id: String, now: Long = System.currentTimeMillis()): Long? {
+        if (preferences.getLong(SNOOZE_DAY_PREFIX + id, Long.MIN_VALUE) != localDayStart(now)) {
             return null
         }
-        return preferences.getLong(SNOOZE_USAGE_PREFIX + packageName, 0L).takeIf { it > 0L }
+        return preferences.getLong(SNOOZE_USAGE_PREFIX + id, 0L).takeIf { it > 0L }
     }
 
     fun clear() {
@@ -107,8 +112,13 @@ class RuleStore(context: Context) {
     }
 
     private fun validate(rule: AppRule) {
-        require(rule.packageName.isNotBlank()) { "Choose an app." }
+        require(rule.id.isNotBlank()) { "Choose an app." }
         require(rule.label.isNotBlank()) { "The app name cannot be blank." }
+        if (rule.sharedApps.isNotEmpty()) {
+            require(rule.sharedApps.size >= 2 && rule.sharedApps.all { (pkg, label) ->
+                pkg.isNotBlank() && label.isNotBlank()
+            }) { "Choose at least two apps for a shared limit." }
+        }
         require(rule.limitMinutes in 1..1440) { "Choose a limit from 1 to 1440 minutes." }
         require(rule.message.isNotBlank() && rule.message.length <= 120) {
             "Enter a reminder of 1 to 120 characters."
@@ -131,8 +141,9 @@ class RuleStore(context: Context) {
     }
 }
 
-internal fun localDayStart(now: Long): Long = Calendar.getInstance().apply {
+internal fun localDayStart(now: Long, dayOffset: Int = 0): Long = Calendar.getInstance().apply {
     timeInMillis = now
+    add(Calendar.DATE, dayOffset)
     set(Calendar.HOUR_OF_DAY, 0)
     set(Calendar.MINUTE, 0)
     set(Calendar.SECOND, 0)

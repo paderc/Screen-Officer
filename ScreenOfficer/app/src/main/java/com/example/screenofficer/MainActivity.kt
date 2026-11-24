@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -24,10 +25,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.*
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardCapitalization
-import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -39,11 +40,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.text.DateFormat
-import java.util.Date
-import kotlin.times
+import java.util.UUID
 
 private data class SavedRules(val apps: List<AppRule>, val categories: List<CategoryRule>)
+private enum class Screen { LIMITS, HISTORY, PICKER, EDIT }
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -76,6 +76,7 @@ private fun OfficerTheme(content: @Composable () -> Unit) {
 }
 
 @Composable
+@OptIn(ExperimentalMaterial3Api::class)
 private fun ScreenOfficerApp(lifecycle: Lifecycle) {
     val context = LocalContext.current
     val store = remember { RuleStore(context.applicationContext) }
@@ -92,12 +93,13 @@ private fun ScreenOfficerApp(lifecycle: Lifecycle) {
     var snapshot by remember { mutableStateOf<UsageSnapshot?>(null) }
     var usageAllowed by remember { mutableStateOf(false) }
     var serviceConnected by remember { mutableStateOf(false) }
-    var refreshing by remember { mutableStateOf(false) }
-    var screen by rememberSaveable { mutableStateOf("home") }
-    var selectedPackage by rememberSaveable { mutableStateOf("") }
+    var screen by rememberSaveable { mutableStateOf(Screen.LIMITS) }
+    var editBackScreen by rememberSaveable { mutableStateOf(Screen.LIMITS) }
+    var selectedRuleId by rememberSaveable { mutableStateOf("") }
     var selectedLabel by rememberSaveable { mutableStateOf("") }
     var selectedCategoryRule by rememberSaveable { mutableStateOf<String?>(null) }
-    var draftHours by rememberSaveable {mutableStateOf(0)}
+    var draftApps by rememberSaveable { mutableStateOf(linkedMapOf<String, String>()) }
+    var draftHours by rememberSaveable { mutableStateOf(0) }
     var draftMinutes by rememberSaveable { mutableStateOf(30) }
     var draftMessage by rememberSaveable { mutableStateOf(DEFAULT_MESSAGE) }
     var draftMode by rememberSaveable { mutableStateOf(BlockMode.SOFT.name) }
@@ -105,11 +107,14 @@ private fun ScreenOfficerApp(lifecycle: Lifecycle) {
     var validation by rememberSaveable { mutableStateOf(false) }
     var search by rememberSaveable { mutableStateOf("") }
     var categoryFilter by rememberSaveable { mutableStateOf<String?>(null) }
+    var appSelection by rememberSaveable { mutableStateOf(linkedMapOf<String, String>()) }
+    var historyDaysAgo by rememberSaveable { mutableIntStateOf(0) }
+    var history by remember { mutableStateOf<DailyUsage?>(null) }
     var notice by rememberSaveable { mutableStateOf<String?>(null) }
     var saving by remember { mutableStateOf(false) }
     var permissionDialog by rememberSaveable { mutableStateOf<String?>(null) }
     var clearDialog by rememberSaveable { mutableStateOf(false) }
-    var removePackage by rememberSaveable { mutableStateOf<String?>(null) }
+    var limitToClear by rememberSaveable { mutableStateOf<String?>(null) }
 
     DisposableEffect(lifecycle) {
         val observer = LifecycleEventObserver { _, _ ->
@@ -126,14 +131,12 @@ private fun ScreenOfficerApp(lifecycle: Lifecycle) {
     LaunchedEffect(resumed, refreshVersion, apps) {
         if (!resumed) return@LaunchedEffect
         do {
-            refreshing = true
             try {
                 val result = withContext(Dispatchers.IO) {
                     val currentRules = store.allRules()
                     val currentCategories = store.allCategoryRules()
-                    val trackedPackages = currentRules.map { it.packageName }.toSet() + apps
-                        .filter { app -> currentCategories.any { it.category in app.categories } }
-                        .map { it.packageName }
+                    val trackedPackages = currentRules.flatMap { it.packages }.toSet() +
+                        currentCategories.flatMap { it.asTarget(apps).packages }
                     Triple(SavedRules(currentRules, currentCategories), repository.hasAccess(), repository.snapshot(trackedPackages))
                 }
                 rules = result.first.apps
@@ -147,9 +150,6 @@ private fun ScreenOfficerApp(lifecycle: Lifecycle) {
                 snapshot = null
                 usageAllowed = false
                 serviceConnected = AppBlockingService.connected
-                notice = "Usage could not be updated. Try Refresh."
-            } finally {
-                refreshing = false
             }
             delay(3_000)
         } while (resumed)
@@ -169,70 +169,119 @@ private fun ScreenOfficerApp(lifecycle: Lifecycle) {
         }
     }
 
-    fun editRule(packageName: String, label: String) {
-        val rule = rules.firstOrNull { it.packageName == packageName }
-        selectedPackage = packageName
-        selectedCategoryRule = null
-        selectedLabel = label
-        draftMinutes = (rule?.limitMinutes ?: 30)
-        draftMessage = rule?.message ?: DEFAULT_MESSAGE
-        draftMode = (rule?.mode ?: BlockMode.SOFT).name
-        draftEnabled = rule?.enabled ?: true
+    val historyDay = localDayStart(snapshot?.checkedAtMs ?: System.currentTimeMillis(), -historyDaysAgo)
+    LaunchedEffect(resumed, screen, historyDay, refreshVersion, usageAllowed) {
+        if (resumed && screen == Screen.HISTORY && usageAllowed) {
+            history = withContext(Dispatchers.IO) { repository.history(historyDay) }
+        }
+    }
+
+    fun editRule(rule: AppRule, category: AppCategoryPreset? = null) {
+        editBackScreen = screen
+        selectedRuleId = rule.id
+        selectedCategoryRule = category?.name
+        selectedLabel = rule.label
+        draftApps = LinkedHashMap(rule.sharedApps)
+        draftHours = rule.limitMinutes / 60
+        draftMinutes = rule.limitMinutes % 60
+        draftMessage = rule.message
+        draftMode = rule.mode.name
+        draftEnabled = rule.enabled
         validation = false
         notice = null
-        screen = "edit"
+        keyboard?.hide()
+        screen = Screen.EDIT
     }
+
     fun editCategory(category: AppCategoryPreset) {
-        val rule = categoryRules.firstOrNull { it.category == category }
-        selectedPackage = ""
-        selectedCategoryRule = category.name
-        selectedLabel = category.title
-        draftMinutes = (rule?.limitMinutes ?: 30)
-        draftMessage = rule?.message ?: DEFAULT_MESSAGE
-        draftMode = (rule?.mode ?: BlockMode.SOFT).name
-        draftEnabled = rule?.enabled ?: true
-        validation = false
-        notice = null
-        screen = "edit"
+        val rule = categoryRules.firstOrNull { it.category == category } ?: CategoryRule(category)
+        editRule(rule.asAppRule(), category)
     }
+
+    fun editSelection() {
+        if (appSelection.isEmpty()) return
+        val existing = rules.firstOrNull { it.packages == appSelection.keys }
+        val rule = existing ?: if (appSelection.size == 1) {
+            val (packageName, label) = appSelection.entries.single()
+            AppRule(packageName, label)
+        } else {
+            AppRule("group.${UUID.randomUUID()}", "Shared limit", sharedApps = appSelection)
+        }
+        editRule(rule)
+    }
+
     fun changeRule(action: () -> Unit, success: String) {
+        if (saving) return
+        saving = true
         scope.launch {
-            saving = true
             try {
-                withContext(Dispatchers.IO) { action() }
+                val updated = withContext(Dispatchers.IO) {
+                    action()
+                    SavedRules(store.allRules(), store.allCategoryRules())
+                }
+                rules = updated.apps
+                categoryRules = updated.categories
                 refreshVersion++
                 notice = success
                 keyboard?.hide()
-                screen = "home"
+                screen = Screen.LIMITS
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
                 notice = "Your change could not be saved. Please try again."
-            } finally { saving = false }
+            } finally {
+                saving = false
+            }
         }
     }
-    fun selectedMinutes() : Int{
-        return draftMinutes + draftHours * 60
-    }
-    BackHandler(screen != "home" && !saving) {
+
+    fun goBack() {
+        if (saving) return
         keyboard?.hide()
-        screen = "home"
+        notice = null
+        screen = if (screen == Screen.EDIT) editBackScreen else Screen.LIMITS
     }
+    BackHandler(screen != Screen.LIMITS, onBack = ::goBack)
 
     Scaffold(
         modifier = Modifier.imePadding(),
         contentWindowInsets = WindowInsets.safeDrawing,
         topBar = {
-            Row(
-                Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.background)
-                    .statusBarsPadding().padding(horizontal = 20.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
+            Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.background).statusBarsPadding()) {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp).heightIn(min = 48.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    if (screen == Screen.PICKER || screen == Screen.EDIT) {
+                        TextButton(onClick = ::goBack, enabled = !saving) { Text("Back") }
+                    }
                     Text("ScreenOfficer", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                    Text("Your phone, your choice", style = MaterialTheme.typography.bodySmall)
                 }
-                if (screen != "home") TextButton(onClick = { keyboard?.hide(); screen = "home" }, enabled = !saving) { Text("Cancel") }
+                if (screen == Screen.LIMITS || screen == Screen.HISTORY) {
+                    PrimaryTabRow(selectedTabIndex = if (screen == Screen.LIMITS) 0 else 1) {
+                        Tab(selected = screen == Screen.LIMITS, onClick = { screen = Screen.LIMITS }, text = { Text("Limits") })
+                        Tab(selected = screen == Screen.HISTORY, onClick = { screen = Screen.HISTORY }, text = { Text("History") })
+                    }
+                }
+            }
+        },
+        bottomBar = {
+            if (screen == Screen.PICKER) {
+                Surface(tonalElevation = 3.dp) {
+                    Button(
+                        onClick = ::editSelection,
+                        enabled = appSelection.isNotEmpty(),
+                        modifier = Modifier.fillMaxWidth().navigationBarsPadding()
+                            .padding(horizontal = 20.dp, vertical = 12.dp).heightIn(min = 52.dp),
+                    ) {
+                        Text(when (appSelection.size) {
+                            0 -> "Continue"
+                            1 -> "Continue with 1 app"
+                            else -> "Continue with ${appSelection.size} apps"
+                        })
+                    }
+                }
             }
         },
     ) { padding ->
@@ -242,14 +291,14 @@ private fun ScreenOfficerApp(lifecycle: Lifecycle) {
                     .verticalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 20.dp),
                 verticalArrangement = Arrangement.spacedBy(18.dp),
             ) {
-                notice?.let {
+                notice?.takeIf { screen != Screen.HISTORY }?.let {
                     Surface(color = MaterialTheme.colorScheme.primaryContainer, shape = RoundedCornerShape(16.dp)) {
                         Text(it, Modifier.fillMaxWidth().padding(16.dp).semantics { liveRegion = LiveRegionMode.Polite })
                     }
                 }
                 when (screen) {
-                    "picker" -> {
-                        Heading("Choose an app", "Pick a category to find apps faster, then select the ones you want to limit.")
+                    Screen.PICKER -> {
+                        Heading("Choose apps", "Check the apps that should share one daily limit.")
                         Text("Browse by category", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                             FilterChip(
@@ -284,47 +333,61 @@ private fun ScreenOfficerApp(lifecycle: Lifecycle) {
                             (selectedCategory == null || selectedCategory in it.categories) &&
                                 (it.label.contains(search, true) || it.packageName.contains(search, true))
                         }
-                        if (!appsLoading && matching.isEmpty()) Text(
-                            if (selectedCategory == null) "No matching apps. Phone, Settings and the home screen are always available."
-                            else "No installed ${selectedCategory.title.lowercase()} apps found. Try All apps or search by name.",
-                        )
-                        matching.forEach { app ->
-                            OutlinedButton(onClick = { editRule(app.packageName, app.label) }, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp), shape = RoundedCornerShape(16.dp)) {
-                                Column(Modifier.fillMaxWidth()) {
-                                    Text(app.label, style = MaterialTheme.typography.titleMedium)
-                                    Text(
-                                        app.categories.takeIf { it.isNotEmpty() }?.joinToString(" · ") { it.title } ?: app.packageName,
-                                        style = MaterialTheme.typography.bodySmall,
-                                    )
-                                }
+                        if (!appsLoading && matching.isEmpty()) {
+                            if (usageAllowed) {
+                                Text("No matching apps in your recent usage.")
+                            } else {
+                                Text("Enable Usage Access to find apps you’ve used recently.")
+                                TextButton(onClick = { permissionDialog = "usage" }) { Text("Enable Usage Access") }
                             }
                         }
+                        matching.forEach { app ->
+                            AppSelectionRow(app, checked = app.packageName in appSelection, onCheckedChange = { checked ->
+                                appSelection = LinkedHashMap(appSelection).apply {
+                                    if (checked) put(app.packageName, app.label) else remove(app.packageName)
+                                }
+                            })
+                        }
                     }
-                    "edit" -> {
+                    Screen.EDIT -> {
                         val category = selectedCategoryRule?.let { AppCategoryPreset.valueOf(it) }
                         Heading(
-                            "A limit on your terms.",
-                            if (category == null) "Set a daily limit for $selectedLabel. Usage resets at midnight in your phone's local time."
-                            else "Set one shared daily limit for every ${category.title.lowercase()} app. Usage resets at midnight in your phone's local time.",
+                            if (category != null || draftApps.isNotEmpty()) "Shared daily limit" else "Daily limit",
+                            when {
+                                category != null -> "All ${category.title.lowercase()} apps share this allowance."
+                                draftApps.isNotEmpty() -> draftApps.values.joinToString(", ")
+                                else -> selectedLabel
+                            },
                         )
-                        Text(
-                            text = "Daily limit",
-                            modifier = Modifier.fillMaxWidth(),
-                        )
-                        PickHourMinute(
-                            initialHour = draftHours,
-                            initialMinute = draftMinutes,
-                            onHourChange = {draftHours = it},
-                            onMinuteChange = {draftMinutes = it},
-                            containerColor = MaterialTheme.colorScheme.primaryContainer,
-                            selectedTextStyle = PickTimeTextStyle(
-                                color = MaterialTheme.colorScheme.onPrimaryContainer
-                            ),
-                            focusIndicator = PickTimeFocusIndicator(
-                                enabled = true,
-                                background = MaterialTheme.colorScheme.primaryContainer
+                        Text("Usage resets at midnight.", style = MaterialTheme.typography.bodySmall)
+                        if (draftHours == 24) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                Text("24 hours", style = MaterialTheme.typography.titleMedium)
+                                TextButton(onClick = {
+                                    draftHours = 23
+                                    draftMinutes = 59
+                                }) { Text("Change duration") }
+                            }
+                        } else {
+                            PickHourMinute(
+                                initialHour = draftHours,
+                                initialMinute = draftMinutes,
+                                onHourChange = { draftHours = it },
+                                onMinuteChange = { draftMinutes = it },
+                                containerColor = MaterialTheme.colorScheme.primaryContainer,
+                                selectedTextStyle = PickTimeTextStyle(
+                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                ),
+                                focusIndicator = PickTimeFocusIndicator(
+                                    enabled = true,
+                                    background = MaterialTheme.colorScheme.primaryContainer,
+                                ),
                             )
-                        )
+                        }
+                        val minutes = draftMinutes + draftHours * 60
+                        if (validation && minutes !in 1..1440) {
+                            Text("Choose a limit of at least one minute.", color = MaterialTheme.colorScheme.error)
+                        }
                         Column(Modifier.selectableGroup(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                             Text("When the limit is reached", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                             ModeChoice("Soft block", "Pause with a reminder. You can choose five more minutes of app use.", draftMode == BlockMode.SOFT.name) { draftMode = BlockMode.SOFT.name }
@@ -337,17 +400,17 @@ private fun ScreenOfficerApp(lifecycle: Lifecycle) {
                             isError = validation && draftMessage.isBlank(),
                             supportingText = { Text(if (validation && draftMessage.isBlank()) "Enter a reminder message." else "${draftMessage.length}/120 characters") },
                         )
-                        Text("You can edit, pause or remove either limit in ScreenOfficer. Blocking needs Usage Access and the ScreenOfficer accessibility service.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         Button(
                             onClick = {
                                 validation = true
-                                val minutes = selectedMinutes()
                                 if (minutes in 1..1440 && draftMessage.isNotBlank()) {
+                                    val mode = BlockMode.valueOf(draftMode)
                                     if (category == null) {
-                                        val rule = AppRule(selectedPackage, selectedLabel, minutes, draftMessage.trim(), BlockMode.valueOf(draftMode), draftEnabled)
-                                        changeRule({ store.save(rule) }, "Limit saved for $selectedLabel.")
+                                        val rule = AppRule(selectedRuleId, selectedLabel, minutes, draftMessage.trim(), mode, draftEnabled, draftApps)
+                                        val message = if (draftApps.isEmpty()) "Limit saved for $selectedLabel." else "Shared limit saved for ${draftApps.size} apps."
+                                        changeRule({ store.save(rule) }, message)
                                     } else {
-                                        val rule = CategoryRule(category, minutes, draftMessage.trim(), BlockMode.valueOf(draftMode), draftEnabled)
+                                        val rule = CategoryRule(category, minutes, draftMessage.trim(), mode, draftEnabled)
                                         changeRule({ store.save(rule) }, "Shared limit saved for ${category.title}.")
                                     }
                                 }
@@ -355,7 +418,16 @@ private fun ScreenOfficerApp(lifecycle: Lifecycle) {
                             enabled = !saving, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp),
                         ) { Text(if (saving) "Saving…" else "Save limit") }
                     }
-                    else -> {
+                    Screen.HISTORY -> UsageHistory(
+                        dayStart = historyDay,
+                        daysAgo = historyDaysAgo,
+                        history = history?.takeIf { it.dayStartMs == historyDay },
+                        usageAllowed = usageAllowed,
+                        onDayChange = { historyDaysAgo = it },
+                        onRefresh = { refreshVersion++ },
+                        onEnableUsage = { permissionDialog = "usage" },
+                    )
+                    Screen.LIMITS -> {
                         Heading("Make room for what matters.", "See today's measured app use and choose when to pause.")
                         AccessCard(
                             usageAllowed, serviceConnected,
@@ -363,47 +435,53 @@ private fun ScreenOfficerApp(lifecycle: Lifecycle) {
                             onBlocking = { permissionDialog = "blocking" },
                         )
                         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                            Column(Modifier.weight(1f)) {
-                                Text("Today", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
-                                val current = snapshot
-                                Text(
-                                    if (current?.available == true && usageAllowed) "Updated ${DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(current.checkedAtMs))}"
-                                    else "Monitoring off · usage unavailable",
-                                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
-                            TextButton(onClick = { refreshVersion++ }, modifier = Modifier.heightIn(min = 48.dp)) { Text(if (refreshing) "Updating…" else "Refresh") }
+                            Text("Today", Modifier.weight(1f), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+                            TextButton(onClick = { refreshVersion++ }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Refresh") }
                         }
                         snapshot?.error?.takeIf { it.isNotBlank() }?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error) }
                         if (rules.isEmpty() && categoryRules.isEmpty()) {
-                            Text("No limits yet. Add an app to begin tracking its daily use.")
+                            Text("No limits yet. Add a limit for one app or a group.")
                         }
+                        val todayUsage = snapshot?.takeIf { it.available && usageAllowed }?.usageMs
                         rules.forEach { rule ->
+                            val target = LimitTarget(rule)
                             RuleCard(
-                                rule, snapshot?.usageMs?.get(rule.packageName)?.takeIf { snapshot?.available == true && usageAllowed },
-                                onEdit = { editRule(rule.packageName, rule.label) },
+                                rule,
+                                todayUsage?.takeIf { it.keys.containsAll(target.packages) }?.let(target::usedMs),
+                                members = rule.sharedApps.values.takeIf { it.isNotEmpty() }?.joinToString(", "),
+                                onEdit = { editRule(rule) },
                                 onToggle = { changeRule({ store.save(rule.copy(enabled = !rule.enabled)) }, if (rule.enabled) "${rule.label} limit paused." else "${rule.label} limit resumed.") },
-                                onRemove = { removePackage = rule.packageName },
+                                onClear = { limitToClear = rule.id },
                                 enabled = !saving,
                             )
                         }
                         categoryRules.forEach { rule ->
+                            val target = rule.asTarget(apps)
                             RuleCard(
-                                AppRule(rule.id, "${rule.label} (shared)", rule.limitMinutes, rule.message, rule.mode, rule.enabled),
-                                snapshot?.usageMs?.let { usage ->
-                                    apps.filter { rule.category in it.categories }.sumOf { usage[it.packageName] ?: 0L }
-                                }?.takeIf { snapshot?.available == true && usageAllowed },
+                                target.rule,
+                                todayUsage?.takeIf { it.keys.containsAll(target.packages) }?.let(target::usedMs),
+                                members = "Shared across ${rule.label.lowercase()} apps",
                                 onEdit = { editCategory(rule.category) },
                                 onToggle = { changeRule({ store.save(rule.copy(enabled = !rule.enabled)) }, if (rule.enabled) "${rule.label} limit paused." else "${rule.label} limit resumed.") },
-                                onRemove = { changeRule({ store.removeCategory(rule.category) }, "Shared limit removed for ${rule.label}.") },
+                                onClear = { limitToClear = rule.id },
                                 enabled = !saving,
                             )
                         }
-                        Button(onClick = { search = ""; categoryFilter = null; screen = "picker"; notice = null }, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) { Text("Add an app") }
+                        Button(
+                            onClick = {
+                                search = ""
+                                categoryFilter = null
+                                appSelection = linkedMapOf()
+                                notice = null
+                                screen = Screen.PICKER
+                            },
+                            enabled = !saving,
+                            modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp),
+                        ) { Text("Add a limit") }
                         Text("Soft blocks let you extend use by five minutes. Hard blocks last until midnight. The phone owner can always change these settings.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         HorizontalDivider()
                         Text("Usage and limits stay on this device. ScreenOfficer does not read app content. Android provides the usage history; timing can vary slightly by device.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        if (rules.isNotEmpty() || categoryRules.isNotEmpty()) TextButton(onClick = { clearDialog = true }, enabled = !saving, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("Clear saved limits") }
+                        if (rules.isNotEmpty() || categoryRules.isNotEmpty()) TextButton(onClick = { clearDialog = true }, enabled = !saving, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("Clear all limits") }
                     }
                 }
                 Spacer(Modifier.height(8.dp))
@@ -412,35 +490,100 @@ private fun ScreenOfficerApp(lifecycle: Lifecycle) {
     }
     if (permissionDialog != null) {
         val usage = permissionDialog == "usage"
+        val blockingServiceLabel = stringResource(R.string.blocking_service_label)
         AlertDialog(
             onDismissRequest = { permissionDialog = null },
-            title = { Text(if (usage) "Allow usage tracking" else "Enable app blocking") },
-            text = { Text(if (usage)
-                "Usage Access lets ScreenOfficer measure time spent in apps with saved limits, including use earlier today. Results stay on this device. You can revoke access in Android Settings."
-                else "The ScreenOfficer accessibility service detects which app is open and displays a blocking screen when its limit is reached. It does not read text, record screens or perform gestures. Enable ScreenOfficer on the next Settings screen. You can turn it off there at any time.") },
-            confirmButton = { TextButton(onClick = {
-                permissionDialog = null
-                try {
-                    if (usage) PermissionAccess.openUsageSettings(context) else PermissionAccess.openAccessibilitySettings(context)
-                } catch (_: Exception) { notice = "Open Android Settings to enable ${if (usage) "Usage Access" else "the ScreenOfficer accessibility service"}." }
-            }) { Text("Open settings") } },
+            title = { Text(if (usage) "Allow usage tracking" else "Set up app blocking") },
+            text = {
+                if (usage) {
+                    Text("Usage Access lets ScreenOfficer measure app use for daily limits and show recent daily totals in History. Results stay on this device. You can revoke access in Android Settings.")
+                } else {
+                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text("The accessibility service detects the open app so ScreenOfficer can show your blocking card.")
+                        Text("On Samsung, tap Installed apps in Accessibility. On other phones, look under Downloaded apps or in the list of services.")
+                        Text("Select $blockingServiceLabel, turn it on, and confirm. Return to ScreenOfficer to check that the service is connected.")
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    permissionDialog = null
+                    try {
+                        if (usage) PermissionAccess.openUsageSettings(context) else PermissionAccess.openAccessibilitySettings(context)
+                    } catch (_: Exception) {
+                        notice = if (usage) {
+                            "Open Android Settings to enable Usage Access."
+                        } else {
+                            "Open Accessibility in Android Settings and select $blockingServiceLabel."
+                        }
+                    }
+                }) { Text(if (usage) "Open settings" else "Open Accessibility settings") }
+            },
             dismissButton = { TextButton(onClick = { permissionDialog = null }) { Text("Cancel") } },
         )
     }
     if (clearDialog) AlertDialog(
-        onDismissRequest = { clearDialog = false }, title = { Text("Clear saved limits?") },
-        text = { Text("Remove all ScreenOfficer limits and five-minute extensions. Android's usage history and access permissions are unchanged.") },
-        confirmButton = { TextButton(onClick = { clearDialog = false; changeRule({ store.clear() }, "All saved limits cleared.") }) { Text("Clear limits") } },
+        onDismissRequest = { clearDialog = false }, title = { Text("Clear all limits?") },
+        text = { Text("Remove all daily limits and their five-minute extensions.") },
+        confirmButton = { TextButton(onClick = { clearDialog = false; changeRule({ store.clear() }, "All limits cleared.") }) { Text("Clear all limits") } },
         dismissButton = { TextButton(onClick = { clearDialog = false }) { Text("Cancel") } },
     )
-    removePackage?.let { packageName ->
-        val label = rules.firstOrNull { it.packageName == packageName }?.label ?: "this app"
-        AlertDialog(
-            onDismissRequest = { removePackage = null }, title = { Text("Remove limit for $label?") },
-            text = { Text("This app will no longer be tracked or blocked by ScreenOfficer.") },
-            confirmButton = { TextButton(onClick = { removePackage = null; changeRule({ store.remove(packageName) }, "Limit removed for $label.") }) { Text("Remove") } },
-            dismissButton = { TextButton(onClick = { removePackage = null }) { Text("Cancel") } },
-        )
+    limitToClear?.let { id ->
+        val rule = rules.firstOrNull { it.id == id }
+        val categoryRule = categoryRules.firstOrNull { it.id == id }
+        if (rule != null || categoryRule != null) {
+            val group = rule?.sharedApps?.values.orEmpty()
+            val title = if (group.isNotEmpty()) "Clear shared limit?" else "Clear limit for ${rule?.label ?: categoryRule?.label}?"
+            AlertDialog(
+                onDismissRequest = { limitToClear = null },
+                title = { Text(title) },
+                text = {
+                    if (group.isNotEmpty()) {
+                        Text(group.joinToString(", "), Modifier.verticalScroll(rememberScrollState()))
+                    } else {
+                        Text("Remove this daily limit and its five-minute extension.")
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        limitToClear = null
+                        changeRule(
+                            action = {
+                                if (categoryRule == null) store.remove(id) else store.removeCategory(categoryRule.category)
+                            },
+                            success = "Limit cleared.",
+                        )
+                    }) { Text("Clear limit") }
+                },
+                dismissButton = { TextButton(onClick = { limitToClear = null }) { Text("Cancel") } },
+            )
+        }
+    }
+}
+
+@Composable
+private fun AppSelectionRow(app: TrackedApp, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
+    Surface(
+        shape = MaterialTheme.shapes.large,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+        color = if (checked) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface,
+    ) {
+        Row(
+            Modifier.fillMaxWidth().heightIn(min = 56.dp)
+                .toggleable(checked, role = Role.Checkbox, onValueChange = onCheckedChange)
+                .padding(horizontal = 14.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Checkbox(checked, onCheckedChange = null)
+            Column(Modifier.weight(1f)) {
+                Text(app.label, style = MaterialTheme.typography.titleMedium)
+                Text(
+                    app.categories.takeIf { it.isNotEmpty() }?.joinToString(" · ") { it.title } ?: app.packageName,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+        }
     }
 }
 
@@ -460,7 +603,7 @@ private fun AccessCard(usage: Boolean, blocking: Boolean, onUsage: () -> Unit, o
             Text("Usage Access: ${if (usage) "on" else "off"}\nBlocking service: ${if (blocking) "connected" else "off"}", style = MaterialTheme.typography.bodyMedium)
             if (!usage || !blocking) Text("Both permissions are needed to interrupt an app at its limit.", style = MaterialTheme.typography.bodySmall)
             TextButton(onClick = onUsage, modifier = Modifier.heightIn(min = 48.dp)) { Text(if (usage) "Manage Usage Access" else "Enable Usage Access") }
-            TextButton(onClick = onBlocking, modifier = Modifier.heightIn(min = 48.dp)) { Text(if (blocking) "Manage blocking service" else "Enable blocking service") }
+            TextButton(onClick = onBlocking, modifier = Modifier.heightIn(min = 48.dp)) { Text(if (blocking) "Manage blocking service" else "Set up app blocking") }
         }
     }
 }
@@ -483,10 +626,19 @@ private fun ModeChoice(title: String, description: String, selected: Boolean, on
 }
 
 @Composable
-private fun RuleCard(rule: AppRule, usedMs: Long?, onEdit: () -> Unit, onToggle: () -> Unit, onRemove: () -> Unit, enabled: Boolean) {
+private fun RuleCard(
+    rule: AppRule,
+    usedMs: Long?,
+    members: String?,
+    onEdit: () -> Unit,
+    onToggle: () -> Unit,
+    onClear: () -> Unit,
+    enabled: Boolean,
+) {
     Card(shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)) {
         Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text(rule.label, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+            members?.let { Text(it, style = MaterialTheme.typography.bodyMedium) }
             Text(if (usedMs == null) "Usage unavailable / ${rule.limitMinutes} min limit" else "${formatUsage(usedMs)} today / ${rule.limitMinutes} min limit", style = MaterialTheme.typography.bodyLarge)
             if (usedMs != null) LinearProgressIndicator(
                 progress = { (usedMs.toFloat() / (rule.limitMinutes * 60_000L)).coerceIn(0f, 1f) },
@@ -497,12 +649,12 @@ private fun RuleCard(rule: AppRule, usedMs: Long?, onEdit: () -> Unit, onToggle:
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 TextButton(onClick = onEdit, enabled = enabled, modifier = Modifier.heightIn(min = 48.dp).semantics { contentDescription = "Edit limit for ${rule.label}" }) { Text("Edit") }
                 TextButton(onClick = onToggle, enabled = enabled, modifier = Modifier.heightIn(min = 48.dp).semantics { contentDescription = "${if (rule.enabled) "Pause" else "Resume"} limit for ${rule.label}" }) { Text(if (rule.enabled) "Pause" else "Resume") }
-                TextButton(onClick = onRemove, enabled = enabled, modifier = Modifier.heightIn(min = 48.dp).semantics { contentDescription = "Remove limit for ${rule.label}" }) { Text("Remove") }
+                TextButton(onClick = onClear, enabled = enabled, modifier = Modifier.heightIn(min = 48.dp).semantics { contentDescription = "Clear limit for ${rule.label}" }) { Text("Clear limit") }
             }
         }
     }
 }
-private fun formatUsage(millis: Long): String {
+internal fun formatUsage(millis: Long): String {
     val seconds = millis.coerceAtLeast(0) / 1_000
     return if (seconds < 60) "$seconds sec" else "${seconds / 60} min ${seconds % 60} sec"
 }

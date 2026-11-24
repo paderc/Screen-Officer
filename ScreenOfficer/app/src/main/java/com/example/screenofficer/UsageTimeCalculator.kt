@@ -12,6 +12,8 @@ data class UsageTimeEvent(
     val activityClass: String? = null,
 )
 
+data class BlockedUsageInterval(val packageName: String, val startMs: Long, val endMs: Long)
+
 data class UsageCalculation(val usageMs: Map<String, Long>, val foregroundPackage: String?)
 
 /**
@@ -25,9 +27,14 @@ object UsageTimeCalculator {
         dayStartMs: Long,
         nowMs: Long,
         trackedPackages: Set<String>,
+        blockedIntervals: List<BlockedUsageInterval> = emptyList(),
     ): UsageCalculation {
         require(nowMs >= dayStartMs)
         val totals = trackedPackages.associateWith { 0L }.toMutableMap()
+        val blocksByPackage = blockedIntervals.asSequence()
+            .filter { it.packageName in trackedPackages && it.endMs > dayStartMs && it.startMs < nowMs }
+            .sortedBy { it.startMs }
+            .groupBy { it.packageName }
         var foreground: String? = null
         var foregroundClass: String? = null
         var sessionStart = dayStartMs
@@ -40,7 +47,20 @@ object UsageTimeCalculator {
             if (pkg != null && pkg in trackedPackages && interactive && !locked) {
                 val start = maxOf(sessionStart, dayStartMs)
                 val end = minOf(at, nowMs)
-                if (end > start) totals[pkg] = totals.getValue(pkg) + end - start
+                if (end > start) {
+                    var used = end - start
+                    var excludedThrough = start
+                    for (interval in blocksByPackage[pkg].orEmpty()) {
+                        if (interval.startMs >= end) break
+                        val overlapStart = maxOf(interval.startMs, excludedThrough)
+                        val overlapEnd = minOf(interval.endMs, end)
+                        if (overlapEnd > overlapStart) {
+                            used -= overlapEnd - overlapStart
+                            excludedThrough = overlapEnd
+                        }
+                    }
+                    totals[pkg] = totals.getValue(pkg) + used
+                }
             }
             sessionStart = at
         }
