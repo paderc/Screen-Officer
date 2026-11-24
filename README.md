@@ -19,3 +19,9 @@ Future:
 - Advancing UI for permmissions.
 - Notification in case of disabled permissions on app enter.
 - Website blocking.
+- Refresh/updating remove
+- Back button
+- Checkboxes for app selection
+- History tab
+- Clear 1 app limit
+- Blocking be small window with app in bg
