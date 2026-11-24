@@ -7,9 +7,7 @@ Authors:
 - Mateusz Pstrągowski
 
 TODO:
-  Igor: 
-    - Refresh/updating remove
-    - Clear 1 app limit
+
 BUGS:
 - When coming back to the application from running app catalogue, the block fails.
 
