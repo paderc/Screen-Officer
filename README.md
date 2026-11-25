@@ -8,9 +8,6 @@ Authors:
 
 TODO:
 
-BUGS:
-- When coming back to the application from running app catalogue, the block fails.
-
 Future:
 - Disable inclusion of usage time of app on the block screen (Not so simple).
 - Informational pamphlets/alternatives for "brain eaters".
